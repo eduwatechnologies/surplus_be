@@ -3,7 +3,6 @@ require("dotenv").config();
 const crypto = require("crypto");
 const User = require("../../models/userModel");
 const Transaction = require("../../models/transactionModel");
-const VTpassService = require("../../providers/vtpass");
 const {
   updateUserBalance,
   refundToVirtualAccount,

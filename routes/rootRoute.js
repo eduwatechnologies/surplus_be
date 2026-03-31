@@ -1,11 +1,9 @@
 const express = require("express");
 const router = express.Router();
-const { getLicenseMode } = require("../utils/license/license");
 
 /* Feature routes */
 const userRoutes = require("./userRoute");
 const staffRoutes = require("./staffRoute");
-const vtpassRoutes = require("./vtpassRoute");
 const billstackRoutes = require("./billstackRoutes");
 const txnRoutes = require("./transactionRoute");
 const notifyRoutes = require("./notificationRouter");
@@ -23,23 +21,15 @@ const categoryProviderRoutes = require("./categoryProviderRoute");
 const statisticsRoutes = require("./statisticRoute");
 const configRoutes = require("./configRoute");
 const { getPublicBranding } = require("../controllers/configController");
+const tenantRoutes = require("./tenantRoute");
+const { getPublicTenantBranding, getPublicTenantPlans } = require("../controllers/tenantController");
 
 /* Mount each base route */
-router.get("/license/status", (req, res) => {
-  const lic = req.license || {};
-  res.json({
-    mode: getLicenseMode(),
-    status: lic.status || "unknown",
-    tier: lic.tier || null,
-    expiresAt: lic.expiresAt || null,
-    features: lic.features || {},
-    customer: lic.customer || null,
-  });
-});
 router.get("/public/branding", getPublicBranding);
+router.get("/public/tenant/:slug/branding", getPublicTenantBranding);
+router.get("/public/tenant/:slug/plans", getPublicTenantPlans);
 router.use("/auth", userRoutes);
 router.use("/staff", staffRoutes);
-router.use("/vtpass", vtpassRoutes);
 router.use("/billstack", billstackRoutes);
 router.use("/transactions", txnRoutes);
 router.use("/notifications", notifyRoutes);
@@ -56,4 +46,5 @@ router.use("/subservices", subServiceRoutes);
 router.use("/category-providers", categoryProviderRoutes);
 router.use("/statistics", statisticsRoutes);
 router.use("/config", configRoutes);
+router.use("/tenants", tenantRoutes);
 module.exports = router;

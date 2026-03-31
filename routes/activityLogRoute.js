@@ -5,7 +5,9 @@ const {
   createLog,
 } = require("../controllers/activitylogController");
 
-router.get("/", getAllLogs);
-router.post("/", createLog);
+const { authMiddlewareStaff, checkRole } = require("../middlewares/auth");
+
+router.get("/", authMiddlewareStaff, checkRole(["superadmin", "admin", "manager", "support"]), getAllLogs);
+router.post("/", authMiddlewareStaff, checkRole(["superadmin", "admin", "manager", "support"]), createLog);
 
 module.exports = router;

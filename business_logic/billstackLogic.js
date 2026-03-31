@@ -1,4 +1,6 @@
 const User = require("../models/userModel");
+const Tenant = require("../models/tenantModel");
+const Transaction = require("../models/transactionModel");
 const mongoose = require("mongoose");
 
 const checkBalance = async (userId) => {
@@ -165,9 +167,106 @@ const updateUserBalance = async (user, amount) => {
   }
 };
 
+const enforceTenantRiskControls = async ({ user, amount, service = null, session = null }) => {
+  const tenantId = user?.tenantId || null;
+  if (!tenantId) return { pinRequired: false, tenant: null };
+
+  const tenant = await Tenant.findOne({ _id: tenantId, status: "active" })
+    .select("riskSettings disabledServices")
+    .lean();
+  if (!tenant) return { pinRequired: false, tenant: null };
+
+  if (service) {
+    const key = String(service || "").trim().toLowerCase();
+    const disabled = Array.isArray(tenant.disabledServices) ? tenant.disabledServices : [];
+    if (disabled.map((s) => String(s).toLowerCase()).includes(key)) {
+      const e = new Error("This service is currently unavailable");
+      e.statusCode = 403;
+      throw e;
+    }
+  }
+
+  const risk = tenant.riskSettings || {};
+  const pinRequired = risk?.pinRequired === true;
+
+  const charge = Number(amount);
+  if (!Number.isFinite(charge) || charge < 0) {
+    const e = new Error("Invalid amount");
+    e.statusCode = 400;
+    throw e;
+  }
+
+  const windowMinutes = Number(risk.velocityWindowMinutes);
+  const maxTx = Number(risk.velocityMaxTx);
+  if (Number.isFinite(windowMinutes) && Number.isFinite(maxTx) && windowMinutes > 0 && maxTx > 0) {
+    const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000);
+    let recentCountQuery = Transaction.countDocuments({
+      userId: user._id,
+      createdAt: { $gte: windowStart },
+    });
+    if (session) recentCountQuery = recentCountQuery.session(session);
+    const recentCount = await recentCountQuery;
+    if (recentCount >= maxTx) {
+      const e = new Error("Too many requests. Please try again shortly.");
+      e.statusCode = 429;
+      throw e;
+    }
+  }
+
+  const kycVerified = String(user?.kycStatus || "").toLowerCase() === "verified";
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+
+  let totalsAgg = Transaction.aggregate([
+    {
+      $match: {
+        userId: user._id,
+        status: "success",
+        createdAt: { $gte: dayStart },
+        service: { $in: ["airtime", "data", "electricity", "cable_tv", "exam_pin"] },
+      },
+    },
+    { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: { $ifNull: ["$amount", 0] } } } },
+  ]);
+  if (session) totalsAgg = totalsAgg.session(session);
+  const totals = await totalsAgg;
+
+  const usedCount = totals[0]?.count || 0;
+  const usedAmount = totals[0]?.amount || 0;
+
+  const amountLimit = kycVerified ? risk.dailyAmountLimitVerified : risk.dailyAmountLimitUnverified;
+  const txLimit = kycVerified ? risk.dailyTxLimitVerified : risk.dailyTxLimitUnverified;
+
+  if (typeof txLimit === "number" && Number.isFinite(txLimit) && txLimit >= 0) {
+    if (usedCount + 1 > txLimit) {
+      const e = new Error("Daily transaction limit reached");
+      e.statusCode = 403;
+      throw e;
+    }
+  }
+  if (typeof amountLimit === "number" && Number.isFinite(amountLimit) && amountLimit >= 0) {
+    if (usedAmount + charge > amountLimit) {
+      const e = new Error("Daily amount limit reached");
+      e.statusCode = 403;
+      throw e;
+    }
+  }
+
+  if (typeof risk.kycRequiredAbove === "number" && Number.isFinite(risk.kycRequiredAbove) && risk.kycRequiredAbove >= 0) {
+    if (!kycVerified && charge > risk.kycRequiredAbove) {
+      const e = new Error("KYC required for this transaction amount");
+      e.statusCode = 403;
+      throw e;
+    }
+  }
+
+  return { pinRequired, tenant };
+};
+
 module.exports = {
   checkBalance,
   deductFromVirtualAccount,
   refundToVirtualAccount,
   updateUserBalance,
+  enforceTenantRiskControls,
 };

@@ -8,7 +8,7 @@ const limiter = require("./middlewares/rateLimiter");
 const apiRoutes = require("./routes/rootRoute");
 const RequestLog = require("./middlewares/log");
 const mongoose = require("mongoose");
-const { attachLicense, enforceLicense } = require("./middlewares/license");
+const { attachTenantFromHost } = require("./middlewares/auth");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -63,7 +63,7 @@ app.get("/ready", (req, res) => {
   return res.status(503).json({ ok: false, db: "not_ready" });
 });
 
-app.use("/api", attachLicense, enforceLicense, apiRoutes);
+app.use("/api", attachTenantFromHost, apiRoutes);
 app.use(errorHandler);
 connectDB();
 app.listen(port, () => {

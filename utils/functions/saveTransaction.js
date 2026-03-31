@@ -42,6 +42,14 @@ const saveTransaction = async ({
           ? response.message
           : response?.response_description || "No message",
       amount: extra.amount || Number(data.amount) || 0,
+      tenantId: extra.tenantId || null,
+      tenantOwnerUserId: extra.tenantOwnerUserId || null,
+      platform_price:
+        typeof extra.platform_price === "number" ? extra.platform_price : null,
+      selling_price:
+        typeof extra.selling_price === "number" ? extra.selling_price : null,
+      merchant_profit:
+        typeof extra.merchant_profit === "number" ? extra.merchant_profit : null,
       reference_no: refNo || null,
       provider_reference: providerReference || null,
       status: status || "failed",

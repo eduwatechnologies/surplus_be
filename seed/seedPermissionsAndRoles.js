@@ -37,9 +37,13 @@ async function run() {
     await role.save();
   }
 
+  await upsertRole("superadmin", "Super Administrator", () => true);
   await upsertRole("admin", "Administrator", () => true);
   await upsertRole("manager", "Manager", (p) => p.id.endsWith(".read"));
   await upsertRole("support", "Support", (p) => p.id.endsWith(".read") && p.module !== "analytics");
+  await upsertRole("merchant", "Merchant", (p) => p.module === "services" || p.module === "transactions");
+  await upsertRole("reseller", "Reseller", (p) => p.module === "services" || p.module === "transactions");
+  await upsertRole("user", "User", (p) => p.module === "services" && p.id.endsWith(".read"));
 
   const adminEmail = process.env.SEED_ADMIN_EMAIL || "admin@example.com";
   const adminPassword = process.env.SEED_ADMIN_PASSWORD || "ChangeMe123!";
@@ -67,4 +71,3 @@ run().catch(async (err) => {
   } catch {}
   process.exit(1);
 });
-

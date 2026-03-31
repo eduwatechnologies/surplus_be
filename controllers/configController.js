@@ -46,8 +46,7 @@ const getPublicBranding = asyncHandler(async (req, res) => {
 const getProviderConfig = asyncHandler(async (req, res) => {
   const cfg = await getConfig("providers");
   const safe = { ...cfg.data };
-  if (safe.vtpass && safe.vtpass.apiKey) safe.vtpass.apiKey = true;
-  if (safe.vtpass && safe.vtpass.secretKey) safe.vtpass.secretKey = true;
+  if (safe.vtpass) delete safe.vtpass;
   if (safe.easyAccess && safe.easyAccess.apiKey) safe.easyAccess.apiKey = true;
   if (safe.autopilot && safe.autopilot.apiKey) safe.autopilot.apiKey = true;
   res.json({ data: safe });
@@ -57,12 +56,6 @@ const updateProviderConfig = asyncHandler(async (req, res) => {
   const body = req.body || {};
   const cfg = await getConfig("providers");
   cfg.data = {
-    vtpass: {
-      publicKey: body?.vtpass?.publicKey || cfg.data?.vtpass?.publicKey || null,
-      apiKey: body?.vtpass?.apiKey || cfg.data?.vtpass?.apiKey || null,
-      secretKey: body?.vtpass?.secretKey || cfg.data?.vtpass?.secretKey || null,
-      baseUrl: body?.vtpass?.baseUrl || cfg.data?.vtpass?.baseUrl || null,
-    },
     easyAccess: {
       apiKey: body?.easyAccess?.apiKey || cfg.data?.easyAccess?.apiKey || null,
       baseUrl: body?.easyAccess?.baseUrl || cfg.data?.easyAccess?.baseUrl || null,

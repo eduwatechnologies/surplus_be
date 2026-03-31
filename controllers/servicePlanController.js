@@ -1,5 +1,26 @@
 const ServicePlan = require("../models/servicePlanModel");
 const Category = require("../models/testingCategoryProviderModel");
+const TenantPlanPrice = require("../models/tenantPlanPriceModel");
+
+function computeSellingPrice(basePrice, override) {
+  const base = Number(basePrice);
+  if (!Number.isFinite(base) || base <= 0) return null;
+  if (!override || override.active === false) return base;
+
+  const value = Number(override.value);
+  if (!Number.isFinite(value)) return base;
+
+  if (override.pricingType === "fixed") {
+    return value >= base ? value : base;
+  }
+  if (override.pricingType === "flat_markup") {
+    return base + value;
+  }
+  if (override.pricingType === "percent_markup") {
+    return base + (base * value) / 100;
+  }
+  return base;
+}
 
 // Expanded network codes for different service types
 const networkCodeMap = {
@@ -54,7 +75,34 @@ const getPlansByNetworkAndCategory = async (req, res) => {
       network: networkCode,
       category: { $regex: `^${category}$`, $options: "i" },
       active: true,
-    });
+    }).lean();
+
+    const tenantId = req.user?.tenantId || req.tenantId;
+    if (tenantId && plans.length) {
+      const planIds = plans.map((p) => p._id);
+      const overrides = await TenantPlanPrice.find({
+        tenantId,
+        planId: { $in: planIds },
+        active: true,
+        userId: { $in: [null, req.user?._id || null] },
+      })
+        .select("planId userId pricingType value active")
+        .lean();
+
+      const userMap = new Map(
+        overrides
+          .filter((o) => o.userId && req.user?._id && String(o.userId) === String(req.user._id))
+          .map((o) => [String(o.planId), o])
+      );
+      const tenantMap = new Map(overrides.filter((o) => !o.userId).map((o) => [String(o.planId), o]));
+
+      for (const p of plans) {
+        const basePrice = Number(p.ourPrice || 0);
+        const override = userMap.get(String(p._id)) || tenantMap.get(String(p._id));
+        const sellingPrice = computeSellingPrice(basePrice, override);
+        if (sellingPrice !== null) p.ourPrice = sellingPrice;
+      }
+    }
 
     return res.json({ success: true, plans });
   } catch (err) {

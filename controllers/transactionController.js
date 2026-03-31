@@ -52,6 +52,15 @@ async function getTransactionById(req, res) {
       return res.status(404).json({ message: "Transaction not found" });
     }
 
+    const userId = req.user?._id;
+    const role = req.user?.role;
+    const staffLikeRoles = ["superadmin", "admin", "manager", "support"];
+    const canViewAny = role && staffLikeRoles.includes(role);
+
+    if (!canViewAny && (!userId || String(transaction.userId) !== String(userId))) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
     res.status(200).json(transaction);
   } catch (error) {
     console.error("❌ Error fetching transaction:", error);

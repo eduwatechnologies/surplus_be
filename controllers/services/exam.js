@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const User = require("../../models/userModel");
+const Tenant = require("../../models/tenantModel");
+const TenantPlanPrice = require("../../models/tenantPlanPriceModel");
 const servicePlanModel = require("../../models/servicePlanModel");
 const saveTransaction = require("../../utils/functions/saveTransaction");
 const EasyAccessService = require("../../providers/easyAccess");
@@ -8,23 +10,54 @@ const EasyAccessService = require("../../providers/easyAccess");
 const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
+  enforceTenantRiskControls,
 } = require("../../business_logic/billstackLogic");
 
 const ALLOWED_PIN_COUNTS = [1, 2, 3, 4, 5, 10];
+
+function computeSellingPrice(basePrice, override) {
+  const base = Number(basePrice);
+  if (!Number.isFinite(base) || base <= 0) return null;
+  if (!override || override.active === false) return base;
+
+  const value = Number(override.value);
+  if (!Number.isFinite(value)) return base;
+
+  if (override.pricingType === "fixed") {
+    return value >= base ? value : base;
+  }
+  if (override.pricingType === "flat_markup") {
+    return base + value;
+  }
+  if (override.pricingType === "percent_markup") {
+    return base + (base * value) / 100;
+  }
+  return base;
+}
 
 const purchaseExamPin = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    const { noOfPin, userId, pinCode, planId } = req.body;
+    const authUserId = req.user?._id;
+    const { noOfPin, userId: bodyUserId, pinCode, planId } = req.body;
+
+    if (!authUserId) {
+      await session.abortTransaction();
+      return res.status(401).json({ success: false, message: "Not authorized" });
+    }
+    if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
+      await session.abortTransaction();
+      return res.status(403).json({ success: false, message: "User mismatch" });
+    }
 
     // 1️⃣ Validate required fields
-    if (!noOfPin || !planId || !userId) {
+    if (!noOfPin || !planId) {
       await session.abortTransaction();
       return res.status(400).json({
         success: false,
-        message: "Missing required fields: 'noOfPin', 'planId', 'userId'",
+        message: "Missing required fields: 'noOfPin', 'planId'",
       });
     }
 
@@ -38,6 +71,7 @@ const purchaseExamPin = async (req, res) => {
     }
 
     // 3️⃣ Validate user
+    const userId = authUserId;
     const user = await User.findById(userId).session(session);
     if (!user) {
       await session.abortTransaction();
@@ -45,18 +79,6 @@ const purchaseExamPin = async (req, res) => {
         success: false,
         message: "User not found",
       });
-    }
-
-    // // 4️⃣ Verify transaction PIN (if enabled)
-    if (user.pinStatus) {
-      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
-      if (!isPinValid) {
-        await session.abortTransaction();
-        return res.status(401).json({
-          success: false,
-          message: "Invalid transaction PIN",
-        });
-      }
     }
 
     // 5️⃣ Fetch plan from DB (with populated subService)
@@ -73,9 +95,73 @@ const purchaseExamPin = async (req, res) => {
       });
     }
 
-    const ourPrice = plan.ourPrice;
-    const totalCost = ourPrice * Number(noOfPin);
+    const baseUnitPrice = Number(plan.ourPrice);
+    if (!Number.isFinite(baseUnitPrice) || baseUnitPrice <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: "Invalid plan pricing" });
+    }
+
+    let effectiveTenantId = user.tenantId || null;
+    let tenantOwnerUserId = null;
+    if (effectiveTenantId) {
+      const tenant = await Tenant.findById(effectiveTenantId)
+        .select("status ownerUserId")
+        .session(session);
+      if (!tenant || tenant.status !== "active") {
+        effectiveTenantId = null;
+      } else {
+        tenantOwnerUserId = tenant.ownerUserId || null;
+      }
+    }
+
+    let override = null;
+    if (effectiveTenantId) {
+      override =
+        (await TenantPlanPrice.findOne({
+          tenantId: effectiveTenantId,
+          userId: user._id,
+          planId: plan._id,
+          active: true,
+        })
+          .select("pricingType value active")
+          .session(session)) ||
+        (await TenantPlanPrice.findOne({
+          tenantId: effectiveTenantId,
+          userId: null,
+          planId: plan._id,
+          active: true,
+        })
+          .select("pricingType value active")
+          .session(session));
+    }
+
+    const rawSellingUnit = computeSellingPrice(baseUnitPrice, override);
+    const sellingUnitPrice = rawSellingUnit === null ? null : Math.round(rawSellingUnit);
+    if (!Number.isFinite(sellingUnitPrice) || sellingUnitPrice <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: "Unable to compute selling price" });
+    }
+
+    const baseTotalCost = baseUnitPrice * Number(noOfPin);
+    const totalCost = sellingUnitPrice * Number(noOfPin);
     const previousBalance = user.balance;
+
+    const { pinRequired } = await enforceTenantRiskControls({ user, amount: totalCost, service: "exam_pin", session });
+    if (pinRequired || user.pinStatus) {
+      if (!pinCode || typeof pinCode !== "string") {
+        await session.abortTransaction();
+        return res.status(400).json({ success: false, message: "Transaction PIN is required" });
+      }
+      if (!user.pinCode) {
+        await session.abortTransaction();
+        return res.status(400).json({ success: false, message: "Set your transaction PIN to continue" });
+      }
+      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
+      if (!isPinValid) {
+        await session.abortTransaction();
+        return res.status(401).json({ success: false, message: "Invalid transaction PIN" });
+      }
+    }
 
     // 6️⃣ Check wallet balance
     if (user.balance < totalCost) {
@@ -123,6 +209,11 @@ const purchaseExamPin = async (req, res) => {
         status: "failed",
         extra: {
           userId,
+          tenantId: effectiveTenantId,
+          tenantOwnerUserId,
+          platform_price: baseTotalCost,
+          selling_price: totalCost,
+          merchant_profit: totalCost - baseTotalCost,
           planId,
           noOfPin,
           amount: totalCost,
@@ -150,6 +241,11 @@ const purchaseExamPin = async (req, res) => {
       status: "success",
       extra: {
         userId,
+        tenantId: effectiveTenantId,
+        tenantOwnerUserId,
+        platform_price: baseTotalCost,
+        selling_price: totalCost,
+        merchant_profit: totalCost - baseTotalCost,
         planId,
         noOfPin,
         amount: totalCost,
@@ -170,10 +266,8 @@ const purchaseExamPin = async (req, res) => {
   } catch (error) {
     console.error("Error purchasing exam pin:", error);
     await session.abortTransaction();
-    return res.status(500).json({
-      success: false,
-      message: "Internal Server Error",
-    });
+    const status = error?.statusCode && Number.isFinite(error.statusCode) ? error.statusCode : 500;
+    return res.status(status).json({ success: false, message: error.message || "Internal Server Error" });
   } finally {
     session.endSession();
   }

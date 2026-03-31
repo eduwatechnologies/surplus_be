@@ -20,8 +20,15 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["admin", "manager", "support", "user", "agent"], // "user" = customer
+      enum: ["user", "agent", "merchant", "reseller"],
       default: "user",
+    },
+
+    tenantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Tenant",
+      default: null,
+      index: true,
     },
 
     state: { type: String, required: true },
@@ -31,6 +38,16 @@ const userSchema = new mongoose.Schema(
     verificationCode: { type: String, default: null },
     verificationCodeExpiry: { type: Date, default: null },
     isVerified: { type: Boolean, default: false },
+    kycStatus: {
+      type: String,
+      enum: ["unverified", "pending", "verified", "rejected"],
+      default: "unverified",
+      index: true,
+    },
+    kycLevel: { type: Number, default: 0 },
+    kycVerifiedAt: { type: Date, default: null },
+    kycRejectedAt: { type: Date, default: null },
+    kycNotes: { type: String, default: null },
     status: {
       type: String,
       enum: ["active", "suspended"],

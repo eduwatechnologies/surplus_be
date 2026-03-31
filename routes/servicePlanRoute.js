@@ -7,12 +7,12 @@ const {
   deleteServicePlan,
 } = require("../controllers/servicePlanController");
 
-const { authMiddlewareStaff, checkRole } = require("../middlewares/auth");
+const { authMiddlewareStaff, checkRole, optionalAuthMiddleware, attachTenantFromHost } = require("../middlewares/auth");
 
 const router = express.Router();
 
 // Public read routes
-router.get("/plans", getPlansByNetworkAndCategory);
+router.get("/plans", attachTenantFromHost, optionalAuthMiddleware, getPlansByNetworkAndCategory);
 router.get("/categories", getCategoriesByNetwork);
 
 // Admin-only create

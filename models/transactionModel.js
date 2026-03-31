@@ -8,6 +8,20 @@ const transactionSchema = new mongoose.Schema(
       required: true,
     },
 
+    tenantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Tenant",
+      default: null,
+      index: true,
+    },
+
+    tenantOwnerUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
+
     service: {
       type: String,
       enum: [
@@ -26,6 +40,9 @@ const transactionSchema = new mongoose.Schema(
     // message: String,
     message: { type: String },
     amount: Number,
+    platform_price: { type: Number, default: null },
+    selling_price: { type: Number, default: null },
+    merchant_profit: { type: Number, default: null },
     provider_reference: { type: String, unique: true, sparse: true },
     reference_no: String,
     status: {

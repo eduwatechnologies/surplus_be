@@ -17,6 +17,7 @@ const {
   REFRESH_EXPIRES_IN,
 } = require("../utils/tokens/token");
 const RefreshToken = require("../models/refreshTokenModal");
+const Tenant = require("../models/tenantModel");
 require("dotenv").config();
 
 // Helpers
@@ -34,7 +35,7 @@ function refreshExpDate() {
 const signUpUser = async (req, res) => {
   const verificationCode = generateVerificationCode();
   const verificationCodeExpiry = Date.now() + 15 * 60 * 1000;
-  const { email, phone, referralCode } = req.body;
+  const { email, phone, referralCode, tenantSlug } = req.body;
 
   try {
     logger.info("User signup attempt", { email, phone });
@@ -46,8 +47,29 @@ const signUpUser = async (req, res) => {
     }
 
     // 🔹 Create new user
+    let tenantId = null;
+    if (tenantSlug) {
+      const slug = String(tenantSlug).trim().toLowerCase();
+      const tenant = await Tenant.findOne({ slug, status: "active" }).select("_id");
+      if (!tenant) {
+        return res.status(400).json({ error: "Invalid merchant link" });
+      }
+      tenantId = tenant._id;
+    } else if (req.tenantId) {
+      tenantId = req.tenantId;
+    }
+
+    if (
+      tenantId &&
+      req.tenantId &&
+      String(tenantId) !== String(req.tenantId)
+    ) {
+      return res.status(400).json({ error: "Merchant link mismatch" });
+    }
+
     const user = new User({
       ...req.body,
+      tenantId,
       verificationCode,
       verificationCodeExpiry,
       isVerified: false,
@@ -75,12 +97,145 @@ const signUpUser = async (req, res) => {
     });
 
     // 🔹 Call Virtual Account Creation After Response (Non-blocking)
-    await createVirtualAccountForUser(user);
+    // await createVirtualAccountForUser(user);
   } catch (error) {
     logger.error("Sign up error", { error: error.message });
     res
       .status(500)
       .json({ msg: "Internal server error", error: error.message });
+  }
+};
+
+function normalizeSlug(slug) {
+  return String(slug || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function isValidSlug(slug) {
+  return /^[a-z0-9-]{3,30}$/.test(slug);
+}
+
+const merchantSignUp = async (req, res) => {
+  const verificationCode = generateVerificationCode();
+  const verificationCodeExpiry = Date.now() + 15 * 60 * 1000;
+
+  const body = req.body || {};
+  const {
+    firstName,
+    lastName,
+    email,
+    phone,
+    state,
+    password,
+    slug: rawSlug,
+    brandName,
+    logoUrl,
+    primaryColor,
+    supportEmail,
+    supportPhone,
+  } = body;
+
+  try {
+    if (!firstName || !lastName || !email || !phone || !state || !password || !rawSlug) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const existingUser = await User.findOne({ $or: [{ email }, { phone }] });
+    if (existingUser) {
+      return res.status(409).json({ error: "Account already exists!" });
+    }
+
+    const slug = normalizeSlug(rawSlug);
+    if (!isValidSlug(slug)) {
+      return res
+        .status(400)
+        .json({ error: "Invalid slug. Use 3-30 chars: letters, numbers, hyphen." });
+    }
+
+    const existingSlug = await Tenant.findOne({ slug }).select("_id");
+    if (existingSlug) {
+      return res.status(409).json({ error: "Slug already taken" });
+    }
+
+    const user = new User({
+      firstName,
+      lastName,
+      email,
+      phone,
+      state,
+      password,
+      role: "merchant",
+      tenantId: null,
+      verificationCode,
+      verificationCodeExpiry,
+      isVerified: false,
+      referralCode: generateReferralCode(),
+      referredBy: null,
+    });
+
+    await user.save();
+
+    const tenant = await Tenant.create({
+      ownerUserId: user._id,
+      slug,
+      status: "active",
+      brandName: typeof brandName === "string" && brandName.trim() ? brandName.trim() : null,
+      logoUrl: typeof logoUrl === "string" && logoUrl.trim() ? logoUrl.trim() : null,
+      primaryColor:
+        typeof primaryColor === "string" && primaryColor.trim() ? primaryColor.trim() : null,
+      supportEmail:
+        typeof supportEmail === "string" && supportEmail.trim() ? supportEmail.trim() : null,
+      supportPhone:
+        typeof supportPhone === "string" && supportPhone.trim() ? supportPhone.trim() : null,
+    });
+
+    user.tenantId = tenant._id;
+
+    await RefreshToken.deleteMany({ userId: user._id });
+
+    const accessToken = signAccessToken({
+      id: user._id,
+      role: user.role,
+      email: user.email,
+    });
+    const refreshToken = signRefreshToken({ id: user._id });
+
+    await RefreshToken.create({
+      token: refreshToken,
+      userId: user._id,
+      expiresAt: refreshExpDate(),
+      createdByIp: req.ip,
+    });
+
+    user.currentToken = accessToken;
+    await user.save();
+
+    return res.status(201).json({
+      accessToken,
+      refreshToken,
+      user: {
+        id: user._id,
+        email: user.email,
+        role: user.role,
+      },
+      tenant: {
+        tenantId: tenant._id,
+        slug: tenant.slug,
+        status: tenant.status,
+        brandName: tenant.brandName || null,
+        logoUrl: tenant.logoUrl || null,
+        primaryColor: tenant.primaryColor || null,
+        supportEmail: tenant.supportEmail || null,
+        supportPhone: tenant.supportPhone || null,
+      },
+    });
+  } catch (error) {
+    logger.error("Merchant sign up error", { error: error.message });
+    return res.status(500).json({ msg: "Internal server error", error: error.message });
   }
 };
 
@@ -107,6 +262,14 @@ const loginUser = async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ error: "Invalid credentials" });
+
+    const requestTenantId = req.tenantId;
+    if (requestTenantId && user.tenantId && String(user.tenantId) !== String(requestTenantId)) {
+      return res.status(403).json({ error: "Account not linked to this merchant" });
+    }
+    if (requestTenantId && !user.tenantId) {
+      user.tenantId = requestTenantId;
+    }
 
     // 🔹 Delete old refresh tokens if you only want ONE active
     await RefreshToken.deleteMany({ userId: user._id });
@@ -522,6 +685,7 @@ const logoutUser = async (req, res) => {
 
 module.exports = {
   signUpUser,
+  merchantSignUp,
   verifyEmail,
   resetPassword,
   loginUser,

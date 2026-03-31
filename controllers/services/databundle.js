@@ -2,16 +2,39 @@ const saveTransaction = require("../../utils/functions/saveTransaction");
 const EasyAccessService = require("../../providers/easyAccess");
 const AutopilotService = require("../../providers/autopilot");
 const ServicePlan = require("../../models/servicePlanModel");
+const Tenant = require("../../models/tenantModel");
+const TenantPlanPrice = require("../../models/tenantPlanPriceModel");
 const User = require("../../models/userModel");
 const bcrypt = require("bcryptjs");
 
 const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
+  enforceTenantRiskControls,
 } = require("../../business_logic/billstackLogic");
 const getDataTypeFromPlanId = require("../../utils/functions/dataTypeFormatter");
 const CategoryProvider = require("../../models/testingCategoryProviderModel");
 const NETWORK_PREFIXES = require("../../utils/constant/networkPrefix");
+
+function computeSellingPrice(basePrice, override) {
+  const base = Number(basePrice);
+  if (!Number.isFinite(base) || base <= 0) return null;
+  if (!override || override.active === false) return base;
+
+  const value = Number(override.value);
+  if (!Number.isFinite(value)) return base;
+
+  if (override.pricingType === "fixed") {
+    return value >= base ? value : base;
+  }
+  if (override.pricingType === "flat_markup") {
+    return base + value;
+  }
+  if (override.pricingType === "percent_markup") {
+    return base + (base * value) / 100;
+  }
+  return base;
+}
 
 const NETWORK_MAP = {
   // Airtime/Data
@@ -23,10 +46,14 @@ const NETWORK_MAP = {
 
 const purchaseData = async (req, res) => {
   try {
-    const { phone, userId, pinCode, planId, networkId, amount } = req.body;
-    console.log(req.body);
+    const authUserId = req.user?._id;
+    const { phone, userId: bodyUserId, pinCode, planId, networkId } = req.body;
+    if (!authUserId) return res.status(401).json({ error: "Not authorized" });
+    if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
+      return res.status(403).json({ error: "User mismatch" });
+    }
 
-    if (!phone || !userId || !planId || !networkId) {
+    if (!phone || !planId || !networkId) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
@@ -44,15 +71,9 @@ const purchaseData = async (req, res) => {
       });
     }
 
+    const userId = authUserId;
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: "User not found" });
-
-    if (user.pinStatus) {
-      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
-      if (!isPinValid) {
-        return res.status(401).json({ error: "Invalid transaction PIN" });
-      }
-    }
 
     const plan = await ServicePlan.findById(planId).populate("subServiceId");
     if (!plan) return res.status(404).json({ error: "Plan not found" });
@@ -63,10 +84,57 @@ const purchaseData = async (req, res) => {
       category: plan.category,
     });
 
-    if (Number(amount) !== Number(plan.ourPrice)) {
-      return res
-        .status(400)
-        .json({ error: "Amount mismatch. Please use plan price." });
+    const basePrice = Number(plan.ourPrice);
+    if (!Number.isFinite(basePrice) || basePrice <= 0) {
+      return res.status(400).json({ error: "Invalid plan pricing" });
+    }
+
+    let effectiveTenantId = user.tenantId || null;
+    let tenantOwnerUserId = null;
+    if (effectiveTenantId) {
+      const tenant = await Tenant.findById(effectiveTenantId).select("status ownerUserId");
+      if (!tenant || tenant.status !== "active") {
+        effectiveTenantId = null;
+      } else {
+        tenantOwnerUserId = tenant.ownerUserId || null;
+      }
+    }
+
+    let override = null;
+    if (effectiveTenantId) {
+      override =
+        (await TenantPlanPrice.findOne({
+          tenantId: effectiveTenantId,
+          userId: user._id,
+          planId: plan._id,
+          active: true,
+        }).select("pricingType value active")) ||
+        (await TenantPlanPrice.findOne({
+          tenantId: effectiveTenantId,
+          userId: null,
+          planId: plan._id,
+          active: true,
+        }).select("pricingType value active"));
+    }
+
+    const rawSellingPrice = computeSellingPrice(basePrice, override);
+    const sellingPrice = rawSellingPrice === null ? null : Math.round(rawSellingPrice);
+    if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
+      return res.status(400).json({ error: "Unable to compute selling price" });
+    }
+
+    const { pinRequired } = await enforceTenantRiskControls({ user, amount: sellingPrice, service: "data" });
+    if (pinRequired || user.pinStatus) {
+      if (!pinCode || typeof pinCode !== "string") {
+        return res.status(400).json({ error: "Transaction PIN is required" });
+      }
+      if (!user.pinCode) {
+        return res.status(400).json({ error: "Set your transaction PIN to continue" });
+      }
+      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
+      if (!isPinValid) {
+        return res.status(401).json({ error: "Invalid transaction PIN" });
+      }
     }
 
     if (!categoryProvider || categoryProvider.status === false) {
@@ -78,7 +146,7 @@ const purchaseData = async (req, res) => {
     const enabledApi = categoryProvider.provider;
     const previousBalance = user?.balance;
 
-    await deductFromVirtualAccount(userId, plan.ourPrice);
+    await deductFromVirtualAccount(userId, sellingPrice);
 
     const networkKey = networkId.toLowerCase();
     const mappedCodes = NETWORK_MAP[networkKey];
@@ -123,7 +191,12 @@ const purchaseData = async (req, res) => {
         status: "failed",
         extra: {
           userId,
-          amount: plan.ourPrice,
+          amount: sellingPrice,
+          tenantId: effectiveTenantId,
+          tenantOwnerUserId,
+          platform_price: basePrice,
+          selling_price: sellingPrice,
+          merchant_profit: sellingPrice - basePrice,
           phone,
           network: networkId,
           dataplan: plan?.name || "",
@@ -133,7 +206,7 @@ const purchaseData = async (req, res) => {
         new_balance: previousBalance,
       });
 
-      await refundToVirtualAccount(userId, amount);
+      await refundToVirtualAccount(userId, sellingPrice);
 
       return res.status(400).json({
         error:
@@ -153,7 +226,12 @@ const purchaseData = async (req, res) => {
       status: "success",
       extra: {
         userId,
-        amount: plan.ourPrice,
+        amount: sellingPrice,
+        tenantId: effectiveTenantId,
+        tenantOwnerUserId,
+        platform_price: basePrice,
+        selling_price: sellingPrice,
+        merchant_profit: sellingPrice - basePrice,
         phone,
         network: networkId,
         dataplan: plan?.name || "",
@@ -170,10 +248,8 @@ const purchaseData = async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error purchasing data:", error);
-    return res.status(500).json({
-      message: "Internal Server Error",
-      error: error.message || "An unexpected error occurred",
-    });
+    const status = error?.statusCode && Number.isFinite(error.statusCode) ? error.statusCode : 500;
+    return res.status(status).json({ error: error.message || "An unexpected error occurred" });
   }
 };
 

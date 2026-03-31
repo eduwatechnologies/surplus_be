@@ -7,7 +7,7 @@ const createStaff = async (req, res) => {
   try {
     const { name, email, phone, password, role } = req.body;
 
-    if (!["admin", "manager", "support"].includes(role)) {
+    if (!["superadmin", "admin", "manager", "support"].includes(role)) {
       return res.status(400).json({ error: "Invalid role specified." });
     }
 
@@ -42,7 +42,6 @@ const createStaff = async (req, res) => {
 
 const loginStaff = async (req, res) => {
   const { email, password } = req.body;
-  console.log(req.body);
 
   try {
     const staff = await Staff.findOne({ email });

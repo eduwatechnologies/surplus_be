@@ -2,10 +2,12 @@ const mongoose = require("mongoose");
 const AutopilotService = require("../../providers/autopilot");
 const saveTransaction = require("../../utils/functions/saveTransaction");
 const User = require("../../models/userModel");
+const Tenant = require("../../models/tenantModel");
 const bcrypt = require("bcryptjs");
 const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
+  enforceTenantRiskControls,
 } = require("../../business_logic/billstackLogic");
 const NETWORK_PREFIXES = require("../../utils/constant/networkPrefix");
 const calculateDiscount = require("../../utils/functions/calculateDiscount");
@@ -22,23 +24,47 @@ const purchaseAirtime = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { planId, phone, amount, userId, pinCode, networkId, airtimeType } =
+    const authUserId = req.user?._id;
+    const { planId, phone, amount, userId: bodyUserId, pinCode, networkId, airtimeType } =
       req.body;
 
+    if (!authUserId) {
+      await session.abortTransaction();
+      return res.status(401).json({ error: "Not authorized" });
+    }
+    if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
+      await session.abortTransaction();
+      return res.status(403).json({ error: "User mismatch" });
+    }
+
+    if (!phone || !amount || !networkId) {
+      await session.abortTransaction();
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
     // 1. Validate user
+    const userId = authUserId;
     const user = await User.findById(userId).session(session);
     if (!user) {
       await session.abortTransaction();
       return res.status(404).json({ error: "User not found" });
     }
 
-    // 2. Validate transaction pin
-    if (user.pinStatus) {
-      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
-      if (!isPinValid) {
-        await session.abortTransaction();
-        return res.status(401).json({ error: "Invalid transaction PIN" });
+    let effectiveTenantId = user.tenantId || null;
+    let tenantOwnerUserId = null;
+    if (effectiveTenantId) {
+      const t = await Tenant.findById(effectiveTenantId).select("status ownerUserId").session(session);
+      if (!t || t.status !== "active") {
+        effectiveTenantId = null;
+      } else {
+        tenantOwnerUserId = t.ownerUserId || null;
       }
+    }
+
+    const parsedAmount = Number(amount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({ error: "Invalid amount" });
     }
 
     // 3. Validate phone prefix
@@ -57,7 +83,30 @@ const purchaseAirtime = async (req, res) => {
     }
 
     const previousBalance = user.balance;
-    const discountedAmount = calculateDiscount(amount, "percentage", 2);
+    const discountedAmount = calculateDiscount(parsedAmount, "percentage", 2);
+
+    const { pinRequired } = await enforceTenantRiskControls({
+      user,
+      amount: discountedAmount,
+      service: "airtime",
+      session,
+    });
+
+    if (pinRequired || user.pinStatus) {
+      if (!pinCode || typeof pinCode !== "string") {
+        await session.abortTransaction();
+        return res.status(400).json({ error: "Transaction PIN is required" });
+      }
+      if (!user.pinCode) {
+        await session.abortTransaction();
+        return res.status(400).json({ error: "Set your transaction PIN to continue" });
+      }
+      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
+      if (!isPinValid) {
+        await session.abortTransaction();
+        return res.status(401).json({ error: "Invalid transaction PIN" });
+      }
+    }
 
     // 4. Deduct wallet inside transaction
     await deductFromVirtualAccount(userId, discountedAmount, session);
@@ -91,6 +140,8 @@ const purchaseAirtime = async (req, res) => {
           status: "failed",
           extra: {
             userId,
+            tenantId: effectiveTenantId,
+            tenantOwnerUserId,
             amount: discountedAmount,
             phone,
             network: networkId,
@@ -121,8 +172,8 @@ const purchaseAirtime = async (req, res) => {
         response: result,
         serviceType: "airtime",
         status: "success",
-        extra: { userId, amount: discountedAmount, phone, network: networkId },
-        transaction_type: "credit",
+        extra: { userId, tenantId: effectiveTenantId, tenantOwnerUserId, amount: discountedAmount, phone, network: networkId },
+        transaction_type: "debit",
         previous_balance: previousBalance,
         new_balance: updatedUser.balance,
       },
@@ -141,10 +192,8 @@ const purchaseAirtime = async (req, res) => {
     session.endSession();
 
     console.error("❌ Error purchasing airtime:", error);
-    return res.status(500).json({
-      message: "Internal Server Error",
-      error: error.message || "An unexpected error occurred",
-    });
+    const status = error?.statusCode && Number.isFinite(error.statusCode) ? error.statusCode : 500;
+    return res.status(status).json({ error: error.message || "An unexpected error occurred" });
   }
 };
 

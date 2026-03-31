@@ -1,6 +1,7 @@
 const express = require("express");
 const {
   signUpUser,
+  merchantSignUp,
   verifyEmail,
   resetPassword,
   loginUser,
@@ -30,6 +31,7 @@ const {
   authMiddleware,
   checkRole,
   authMiddlewareStaff,
+  attachTenantFromHost,
 } = require("../middlewares/auth");
 const limiter = require("../middlewares/rateLimiter");
 
@@ -40,12 +42,14 @@ router.get("/user", authMiddleware, CurrentUser);
 // router.get("/refresh-token", authMiddleware, refreshToken);
 
 // User Sign-Up
-router.post("/signup", signUpUser);
+router.post("/signup", attachTenantFromHost, signUpUser);
 // User Sign-Up
 router.post("/verify", verifyEmail);
 
+router.post("/merchant/signup", limiter, merchantSignUp);
+
 // User Login
-router.post("/login", loginUser);
+router.post("/login", attachTenantFromHost, loginUser);
 router.post("/resend-verification", resendVerificationCode);
 
 router.post("/refresh", refreshAccessToken);

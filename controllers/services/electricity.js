@@ -3,11 +3,13 @@ const AutopilotService = require("../../providers/autopilot");
 const User = require("../../models/userModel");
 const bcrypt = require("bcryptjs");
 const SubService = require("../../models/subServicesModel");
+const Tenant = require("../../models/tenantModel");
 const saveTransaction = require("../../utils/functions/saveTransaction");
 
 const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
+  enforceTenantRiskControls,
 } = require("../../business_logic/billstackLogic");
 
 const NETWORK_MAP = {
@@ -67,13 +69,47 @@ const verifyMeter = async (req, res) => {
 
 const purchaseElectricity = async (req, res) => {
   try {
-    const { company, type, meter_no, amount, userId, pinCode, planId, phone } =
+    const authUserId = req.user?._id;
+    const { company, type, meter_no, amount, userId: bodyUserId, pinCode, planId, phone } =
       req.body;
 
+    if (!authUserId) return res.status(401).json({ error: "Not authorized" });
+    if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
+      return res.status(403).json({ error: "User mismatch" });
+    }
+
+    if (!company || !type || !meter_no || !amount || !phone) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const parsedAmount = Number(amount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount < 50) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
+
+    const userId = authUserId;
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    if (user.pinStatus) {
+    let effectiveTenantId = user.tenantId || null;
+    let tenantOwnerUserId = null;
+    if (effectiveTenantId) {
+      const t = await Tenant.findById(effectiveTenantId).select("status ownerUserId").lean();
+      if (!t || t.status !== "active") {
+        effectiveTenantId = null;
+      } else {
+        tenantOwnerUserId = t.ownerUserId || null;
+      }
+    }
+
+    const { pinRequired } = await enforceTenantRiskControls({ user, amount: parsedAmount, service: "electricity" });
+    if (pinRequired || user.pinStatus) {
+      if (!pinCode || typeof pinCode !== "string") {
+        return res.status(400).json({ error: "Transaction PIN is required" });
+      }
+      if (!user.pinCode) {
+        return res.status(400).json({ error: "Set your transaction PIN to continue" });
+      }
       const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
       if (!isPinValid) {
         return res.status(401).json({ error: "Invalid transaction PIN" });
@@ -87,7 +123,7 @@ const purchaseElectricity = async (req, res) => {
 
     const previousBalance = user?.balance;
 
-    await deductFromVirtualAccount(userId, amount);
+    await deductFromVirtualAccount(userId, parsedAmount);
 
     const enabledApi = plan.provider;
     const companyKey = company.toLowerCase().replace(/\s+/g, "");
@@ -102,13 +138,13 @@ const purchaseElectricity = async (req, res) => {
             disco: mappedCodes.autopilot,
             meterNumber: meter_no,
             meterType: type.toLowerCase() === "prepaid" ? "01" : "02",
-            amount,
+            amount: parsedAmount,
           })
         : await EasyAccessService.payElectricityBill({
             company: mappedCodes.easyaccess,
             metertype: type.toLowerCase() === "prepaid" ? "01" : "02",
             meterno: meter_no,
-            amount,
+            amount: parsedAmount,
           });
 
     let transaction;
@@ -125,7 +161,9 @@ const purchaseElectricity = async (req, res) => {
         status: "failed",
         extra: {
           userId,
-          amount,
+          tenantId: effectiveTenantId,
+          tenantOwnerUserId,
+          amount: parsedAmount,
           phone,
           network: company.toLowerCase(),
           meterType: type,
@@ -136,7 +174,7 @@ const purchaseElectricity = async (req, res) => {
         new_balance: previousBalance,
       });
 
-      await refundToVirtualAccount(userId, amount);
+      await refundToVirtualAccount(userId, parsedAmount);
 
       return res.status(400).json({
         message: "❌ Electricity purchase failed",
@@ -153,7 +191,9 @@ const purchaseElectricity = async (req, res) => {
       status: "success",
       extra: {
         userId,
-        amount,
+        tenantId: effectiveTenantId,
+        tenantOwnerUserId,
+        amount: parsedAmount,
         phone,
         network: company.toLowerCase(),
         meterType: type,
@@ -171,7 +211,8 @@ const purchaseElectricity = async (req, res) => {
     });
   } catch (err) {
     console.error("Error purchasing electricity:", err);
-    return res.status(500).json({ error: "Server error" });
+    const status = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+    return res.status(status).json({ error: err.message || "Server error" });
   }
 };
 

@@ -1,6 +1,5 @@
 const express = require("express");
 const { authMiddlewareStaff, checkRole } = require("../middlewares/auth");
-const { requireFeature } = require("../middlewares/license");
 const {
   getBrandConfig,
   updateBrandConfig,
@@ -35,9 +34,7 @@ router.put(
   "/providers",
   authMiddlewareStaff,
   checkRole(["admin"]),
-  requireFeature("provider_manager", { minTier: "pro" }),
   updateProviderConfig
 );
 
 module.exports = router;
-

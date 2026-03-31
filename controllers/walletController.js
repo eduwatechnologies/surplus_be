@@ -1,7 +1,8 @@
 const BillstackService = require("../services/payments/billstackService");
 const User = require("../models/userModel");
-const Wallet = require("../models/walletModel")
+const Wallet = require("../models/walletModel");
 
+const staffLikeRoles = ["superadmin", "admin", "manager", "support"];
 
 /**
  * Create Virtual Account
@@ -13,9 +14,16 @@ const createVirtualAccount = async (req, res) => {
     return res.status(400).json({ error: "User not Found" });
   }
 
+  const requesterId = req.user?._id;
+  const requesterRole = req.user?.role;
+  const canManageAny = requesterRole && staffLikeRoles.includes(String(requesterRole));
+  if (!canManageAny && (!requesterId || String(requesterId) !== String(userId))) {
+    return res.status(403).json({ error: "Access denied" });
+  }
+
   try {
     const response = await BillstackService.createVirtualAccount({
-      userId,
+      user: userId,
       email,
       reference,
       firstName,
@@ -37,7 +45,7 @@ const createVirtualAccount = async (req, res) => {
         bankCode: accountData.bank_code,
         reference: response.data.data.reference,
         meta: response.data.data.meta,
-        createdAt: new Date(accountData.created_at),
+        providerCreatedAt: accountData.created_at ? new Date(accountData.created_at) : null,
       });
 
       await newAccount.save();
@@ -58,12 +66,19 @@ const getVirtualAccount = async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const user = User.findById({userId});
-    if(!user){
+    const requesterId = req.user?._id;
+    const requesterRole = req.user?.role;
+    const canViewAny = requesterRole && staffLikeRoles.includes(String(requesterRole));
+    if (!canViewAny && (!requesterId || String(requesterId) !== String(userId))) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    const user = await User.findById(userId).select("_id").lean();
+    if (!user) {
       return res.status(404).json({ message: "User not Found." });
     }
 
-    const accounts = await Wallet.find({ user: userId });
+    const accounts = await Wallet.find({ user: userId }).sort({ createdAt: -1 }).lean();
 
     if (!accounts || accounts.length === 0) {
       return res.status(404).json({ message: "No virtual account found for this user." });
