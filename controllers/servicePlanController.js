@@ -1,6 +1,7 @@
 const ServicePlan = require("../models/servicePlanModel");
 const Category = require("../models/testingCategoryProviderModel");
 const TenantPlanPrice = require("../models/tenantPlanPriceModel");
+const { resolveNetworkCodes, normalizeServiceType } = require("../utils/networkCatalog");
 
 function computeSellingPrice(basePrice, override) {
   const base = Number(basePrice);
@@ -22,34 +23,9 @@ function computeSellingPrice(basePrice, override) {
   return base;
 }
 
-// Expanded network codes for different service types
-const networkCodeMap = {
-  // Airtime/Data
-  mtn: "01",
-  airtel: "02",
-  glo: "03",
-  "9mobile": "04",
-
-  // Cable TV
-  dstv: "05",
-  gotv: "06",
-  startimes: "07",
-  showmax: "08",
-
-  // Electricity (example)
-  ikejaelectric: "01",
-  ekoelectric: "02",
-  abujaelectric: "03",
-
-  //Exam
-  waec: "01",
-  neco: "02",
-  nabteb: "03",
-};
-
 const getPlansByNetworkAndCategory = async (req, res) => {
   try {
-    let { network, category } = req.query;
+    let { network, category, serviceType } = req.query;
 
     if (!network || !category) {
       return res.status(400).json({
@@ -61,21 +37,23 @@ const getPlansByNetworkAndCategory = async (req, res) => {
     network = network.toLowerCase().trim();
     category = category.toLowerCase().trim();
 
-    const networkCode = networkCodeMap[network];
-    if (!networkCode) {
+    const networkCodes = resolveNetworkCodes(network);
+    if (!networkCodes) {
       return res.status(400).json({
         success: false,
-        message: `Invalid network '${network}'. Allowed: ${Object.keys(
-          networkCodeMap
-        ).join(", ")}`,
+        message: "Invalid network",
       });
     }
 
-    const plans = await ServicePlan.find({
-      network: networkCode,
+    const normalizedServiceType = normalizeServiceType(serviceType);
+    const q = {
+      network: { $in: networkCodes },
       category: { $regex: `^${category}$`, $options: "i" },
       active: true,
-    }).lean();
+    };
+    if (normalizedServiceType) q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
+
+    const plans = await ServicePlan.find(q).lean();
 
     const tenantId = req.user?.tenantId || req.tenantId;
     if (tenantId && plans.length) {
@@ -97,9 +75,10 @@ const getPlansByNetworkAndCategory = async (req, res) => {
       const tenantMap = new Map(overrides.filter((o) => !o.userId).map((o) => [String(o.planId), o]));
 
       for (const p of plans) {
-        const basePrice = Number(p.ourPrice || 0);
+        const rawBase = Number(p.ourPrice);
+        const basePrice = Number.isFinite(rawBase) && rawBase > 0 ? rawBase : null;
         const override = userMap.get(String(p._id)) || tenantMap.get(String(p._id));
-        const sellingPrice = computeSellingPrice(basePrice, override);
+        const sellingPrice = basePrice === null ? null : computeSellingPrice(basePrice, override);
         if (sellingPrice !== null) p.ourPrice = sellingPrice;
       }
     }
@@ -124,17 +103,15 @@ const getCategoriesByNetwork = async (req, res) => {
     }
 
     // Normalize inputs
-    serviceType = serviceType.toLowerCase().trim();
+    serviceType = normalizeServiceType(serviceType);
     network = network.toLowerCase().trim();
 
     // 🧩 Validate and map network code
-    const networkCode = networkCodeMap[network];
-    if (!networkCode) {
+    const networkCodes = resolveNetworkCodes(network);
+    if (!networkCodes) {
       return res.status(400).json({
         success: false,
-        message: `Invalid network '${network}'. Allowed networks: ${Object.keys(
-          networkCodeMap
-        ).join(", ")}`,
+        message: "Invalid network",
       });
     }
 
@@ -152,7 +129,7 @@ const getCategoriesByNetwork = async (req, res) => {
 
     // 🧩 Step 2: Fetch ACTIVE service plans by network + serviceType
     const activePlans = await ServicePlan.find({
-      network: networkCode,
+      network: { $in: networkCodes },
       serviceType: { $regex: `^${serviceType}$`, $options: "i" },
       active: true,
     });

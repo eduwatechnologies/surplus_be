@@ -7,6 +7,7 @@ const Transaction = require("../models/transactionModel");
 const RefreshToken = require("../models/refreshTokenModal");
 const ActivityLog = require("../models/activityLogModel");
 const { signAccessToken, signRefreshToken } = require("../utils/tokens/token");
+const { resolveNetworkCodes, normalizeServiceType } = require("../utils/networkCatalog");
 
 function normalizeSlug(slug) {
   return String(slug || "")
@@ -906,62 +907,36 @@ const upsertUserPlanPrices = asyncHandler(async (req, res) => {
   return res.json({ success: true });
 });
 
-const networkCodeMap = {
-  mtn: "01",
-  airtel: "02",
-  etisalat: "03",
-  "9mobile": "03",
-  glo: "04",
-  glo1: "04",
-  showmax: "06",
-
-  //Cable Tv
-  gotv: "01",
-  dstv: "02",
-  startime: "03",
-
-  //Electricity
-  ikejaelectric: "01",
-  ekoelectric: "02",
-  abujaelectric: "03",
-
-  //Exam
-  waec: "01",
-  neco: "02",
-  nabteb: "03",
-};
-
 const getMyPricingCatalog = asyncHandler(async (req, res) => {
   const tenantId = req.user?.tenantId;
   if (!tenantId) return res.status(400).json({ error: "Merchant profile not found" });
 
-  let { network, category, limit } = req.query;
+  let { network, category, limit, serviceType } = req.query;
   if (!network || !category) {
     return res.status(400).json({ error: "Both 'network' and 'category' are required" });
   }
 
   const normalizedNetwork = String(network).toLowerCase().trim();
   const normalizedCategory = String(category).toLowerCase().trim();
+  const normalizedServiceType = normalizeServiceType(serviceType);
 
-  const networkCode = /^\d{2}$/.test(normalizedNetwork)
-    ? normalizedNetwork
-    : networkCodeMap[normalizedNetwork];
-
-  if (!networkCode) {
+  const networkCodes = resolveNetworkCodes(normalizedNetwork);
+  if (!networkCodes) {
     return res.status(400).json({
-      error: `Invalid network '${normalizedNetwork}'. Allowed: ${Object.keys(networkCodeMap).join(
-        ", "
-      )}`,
+      error: "Invalid network",
     });
   }
 
   const safeLimit = Math.min(Math.max(parseInt(String(limit || "200"), 10) || 200, 1), 500);
 
-  const plans = await ServicePlan.find({
-    network: networkCode,
+  const q = {
+    network: { $in: networkCodes },
     category: { $regex: `^${normalizedCategory}$`, $options: "i" },
     active: true,
-  })
+  };
+  if (normalizedServiceType) q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
+
+  const plans = await ServicePlan.find(q)
     .select("name validity category serviceType network ourPrice subServiceId")
     .limit(safeLimit)
     .lean();
@@ -978,9 +953,10 @@ const getMyPricingCatalog = asyncHandler(async (req, res) => {
   const map = new Map(overrides.map((o) => [String(o.planId), o]));
 
   const data = plans.map((p) => {
-    const basePrice = Number(p.ourPrice || 0);
+    const rawBase = Number(p.ourPrice);
+    const basePrice = Number.isFinite(rawBase) && rawBase > 0 ? rawBase : null;
     const override = map.get(String(p._id)) || null;
-    const sellingPrice = computeSellingPrice(basePrice, override);
+    const sellingPrice = basePrice === null ? null : computeSellingPrice(basePrice, override);
     return {
       planId: p._id,
       name: p.name,
@@ -988,7 +964,7 @@ const getMyPricingCatalog = asyncHandler(async (req, res) => {
       category: p.category || null,
       serviceType: p.serviceType,
       network: p.network,
-      basePrice: Number.isFinite(basePrice) ? basePrice : null,
+      basePrice,
       sellingPrice,
       override: override
         ? {
@@ -1008,33 +984,32 @@ const getUserPricingCatalog = asyncHandler(async (req, res) => {
   const ctx = await resolveTenantUser(req, res);
   if (!ctx) return;
 
-  let { network, category, limit } = req.query;
+  let { network, category, limit, serviceType } = req.query;
   if (!network || !category) {
     return res.status(400).json({ error: "Both 'network' and 'category' are required" });
   }
 
   const normalizedNetwork = String(network).toLowerCase().trim();
   const normalizedCategory = String(category).toLowerCase().trim();
+  const normalizedServiceType = normalizeServiceType(serviceType);
 
-  const networkCode = /^\d{2}$/.test(normalizedNetwork)
-    ? normalizedNetwork
-    : networkCodeMap[normalizedNetwork];
-
-  if (!networkCode) {
+  const networkCodes = resolveNetworkCodes(normalizedNetwork);
+  if (!networkCodes) {
     return res.status(400).json({
-      error: `Invalid network '${normalizedNetwork}'. Allowed: ${Object.keys(networkCodeMap).join(
-        ", "
-      )}`,
+      error: "Invalid network",
     });
   }
 
   const safeLimit = Math.min(Math.max(parseInt(String(limit || "200"), 10) || 200, 1), 500);
 
-  const plans = await ServicePlan.find({
-    network: networkCode,
+  const q = {
+    network: { $in: networkCodes },
     category: { $regex: `^${normalizedCategory}$`, $options: "i" },
     active: true,
-  })
+  };
+  if (normalizedServiceType) q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
+
+  const plans = await ServicePlan.find(q)
     .select("name validity category serviceType network ourPrice subServiceId")
     .limit(safeLimit)
     .lean();
@@ -1060,11 +1035,12 @@ const getUserPricingCatalog = asyncHandler(async (req, res) => {
   const tenantMap = new Map(tenantOverrides.map((o) => [String(o.planId), o]));
 
   const data = plans.map((p) => {
-    const basePrice = Number(p.ourPrice || 0);
+    const rawBase = Number(p.ourPrice);
+    const basePrice = Number.isFinite(rawBase) && rawBase > 0 ? rawBase : null;
     const uo = userMap.get(String(p._id)) || null;
     const to = tenantMap.get(String(p._id)) || null;
     const effectiveOverride = uo || to;
-    const sellingPrice = computeSellingPrice(basePrice, effectiveOverride);
+    const sellingPrice = basePrice === null ? null : computeSellingPrice(basePrice, effectiveOverride);
     return {
       planId: p._id,
       name: p.name,
@@ -1072,7 +1048,7 @@ const getUserPricingCatalog = asyncHandler(async (req, res) => {
       category: p.category || null,
       serviceType: p.serviceType,
       network: p.network,
-      basePrice: Number.isFinite(basePrice) ? basePrice : null,
+      basePrice,
       sellingPrice,
       overrideLevel: uo ? "user" : to ? "tenant" : null,
       userOverride: uo

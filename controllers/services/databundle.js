@@ -79,9 +79,11 @@ const purchaseData = async (req, res) => {
     if (!plan) return res.status(404).json({ error: "Plan not found" });
     let detectedDataType = getDataTypeFromPlanId(plan.autopilotId);
 
+    const normalizedCategory = String(plan.category || "").toUpperCase().trim();
     const categoryProvider = await CategoryProvider.findOne({
-      network: networkId.toUpperCase(),
-      category: plan.category,
+      subServiceId: plan.subServiceId?._id,
+      network: String(networkId || "").toUpperCase().trim(),
+      category: normalizedCategory,
     });
 
     const basePrice = Number(plan.ourPrice);

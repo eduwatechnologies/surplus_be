@@ -21,13 +21,12 @@ const getAllCategoryProviders = async (req, res) => {
 
 const createCategoryProvider = async (req, res) => {
   try {
-    const { subServiceId, network, category, provider, providerCodes, status } =
-      req.body;
+    const { subServiceId, network, category, provider, providerCodes, status } = req.body;
 
     const mapping = await CategoryProvider.create({
       subServiceId,
-      network: network.toUpperCase(),
-      category: category.toUpperCase(),
+      network: String(network || "").toUpperCase().trim(),
+      category: String(category || "").toUpperCase().trim(),
       provider,
       providerCodes,
       status: status ?? true,
@@ -50,8 +49,8 @@ const updateCategoryProvider = async (req, res) => {
         .json({ error: "Category-Provider mapping not found" });
     }
 
-    if (network) mapping.network = network.toUpperCase();
-    if (category) mapping.category = category.toUpperCase();
+    if (network) mapping.network = String(network).toUpperCase().trim();
+    if (category) mapping.category = String(category).toUpperCase().trim();
     if (provider) mapping.provider = provider;
     if (providerCodes) mapping.providerCodes = providerCodes;
     if (status !== undefined) mapping.status = status;

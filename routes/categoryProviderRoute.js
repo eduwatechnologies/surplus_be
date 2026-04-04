@@ -15,7 +15,6 @@ router.get("/", getAllCategoryProviders);
 
 router.get(
   "/sub-service/:subServiceId",
-  authMiddlewareStaff,
   getCategoriesBySubServiceId
 );
 

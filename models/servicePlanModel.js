@@ -17,9 +17,21 @@ const servicePlanSchema = new mongoose.Schema(
     ourPrice: { type: Number },
     easyaccessId: { type: String },
     autopilotId: { type: String },
+    planKey: { type: String },
+    planKind: { type: String, enum: ["fixed", "variable"], default: "fixed" },
     active: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
+
+servicePlanSchema.index({ planKey: 1 }, { unique: true, sparse: true });
+servicePlanSchema.index({
+  subServiceId: 1,
+  category: 1,
+  name: 1,
+  validity: 1,
+  network: 1,
+  serviceType: 1,
+});
 
 module.exports = mongoose.model("ServicePlan", servicePlanSchema);
