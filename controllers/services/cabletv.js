@@ -11,6 +11,7 @@ const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
   enforceTenantRiskControls,
+  runInMongoTransaction,
 } = require("../../business_logic/billstackLogic");
 const NETWORK_MAP = {
   dstv: { easyaccess: "01", autopilot: "1" },
@@ -38,6 +39,31 @@ function computeSellingPrice(basePrice, override) {
   }
   return base;
 }
+
+const httpError = (statusCode, message) => {
+  const e = new Error(message);
+  e.statusCode = statusCode;
+  return e;
+};
+
+const toTransactionSummary = (t) => {
+  if (!t) return null;
+  return {
+    _id: t._id,
+    service: t.service,
+    status: t.status,
+    message: t.message,
+    amount: t.amount,
+    reference_no: t.reference_no,
+    provider_reference: t.provider_reference,
+    createdAt: t.createdAt,
+    company: t.company,
+    iucno: t.iucno,
+    package: t.package,
+    previous_balance: t.previous_balance,
+    new_balance: t.new_balance,
+  };
+};
 
 const verifyTVSub = async (req, res) => {
   try {
@@ -68,175 +94,146 @@ const verifyTVSub = async (req, res) => {
 
 const purchaseTVSub = async (req, res) => {
   try {
-    const authUserId = req.user?._id;
-    const {
-      provider,
-      planId,
-      customerName,
-      smartCardNo,
-      phone,
-      paymentTypes = "FULL_PAYMENT",
-      pinCode,
-      networkId,
-    } = req.body;
-
-    if (!authUserId) return res.status(401).json({ error: "Not authorized" });
-    if (req.body.userId && String(req.body.userId) !== String(authUserId)) {
-      return res.status(403).json({ error: "User mismatch" });
-    }
-
-    // 1. Validate user
-    const userId = authUserId;
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    // 3. Get plan
-    const plan = await ServicePlan.findById(planId).populate("subServiceId");
-    if (!plan || !plan.active) {
-      return res.status(404).json({ error: "Plan not found or inactive" });
-    }
-
-    const basePrice = Number(plan.ourPrice);
-    if (!Number.isFinite(basePrice) || basePrice <= 0) {
-      return res.status(400).json({ error: "Invalid plan pricing" });
-    }
-
-    let effectiveTenantId = user.tenantId || null;
-    let tenantOwnerUserId = null;
-    if (effectiveTenantId) {
-      const tenant = await Tenant.findById(effectiveTenantId).select("status ownerUserId");
-      if (!tenant || tenant.status !== "active") {
-        effectiveTenantId = null;
-      } else {
-        tenantOwnerUserId = tenant.ownerUserId || null;
-      }
-    }
-
-    let override = null;
-    if (effectiveTenantId) {
-      override =
-        (await TenantPlanPrice.findOne({
-          tenantId: effectiveTenantId,
-          userId: user._id,
-          planId: plan._id,
-          active: true,
-        }).select("pricingType value active")) ||
-        (await TenantPlanPrice.findOne({
-          tenantId: effectiveTenantId,
-          userId: null,
-          planId: plan._id,
-          active: true,
-        }).select("pricingType value active"));
-    }
-
-    const rawSellingPrice = computeSellingPrice(basePrice, override);
-    const sellingPrice = rawSellingPrice === null ? null : Math.round(rawSellingPrice);
-    if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
-      return res.status(400).json({ error: "Unable to compute selling price" });
-    }
-
-    const { pinRequired } = await enforceTenantRiskControls({ user, amount: sellingPrice, service: "cable_tv" });
-    if (pinRequired || user.pinStatus) {
-      if (!pinCode || typeof pinCode !== "string") {
-        return res.status(400).json({ error: "Transaction PIN is required" });
-      }
-      if (!user.pinCode) {
-        return res.status(400).json({ error: "Set your transaction PIN to continue" });
-      }
-      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
-      if (!isPinValid) {
-        return res.status(401).json({ error: "Invalid transaction PIN" });
-      }
-    }
-
-    const enabledApi = plan.subServiceId.provider;
-    const previousBalance = user.balance;
-    await deductFromVirtualAccount(userId, sellingPrice);
-
-    // 4. Get mapped network (optional)
-    let mappedCodes = null;
-    if (networkId) {
-      const networkKey = networkId.toLowerCase();
-      mappedCodes = NETWORK_MAP[networkKey];
-      if (!mappedCodes) {
-        return res.status(400).json({ error: "Invalid network selected" });
-      }
-    }
-
-    // 5. Call provider
-    let result;
-    if (enabledApi === "autopilot") {
-      result = await AutopilotService.payTVSubscription({
-        cableType: provider,
-        planId: plan.autopilotId,
-        smartCardNo,
+    const result = await runInMongoTransaction(async (session) => {
+      const authUserId = req.user?._id;
+      const {
+        provider,
+        planId,
         customerName,
+        smartCardNo,
         phone,
-        amount: basePrice,
-        paymentTypes,
-      });
-    } else if (enabledApi === "easyaccess") {
-      result = await EasyAccessService.payTVSubscription({
-        company: provider,
-        iucno: smartCardNo,
-        packageCode: plan.easyaccessId,
-        amount: basePrice,
-      });
-    } else {
-      return res.status(400).json({
-        error: "Invalid API provider. Use 'autopilot' or 'easyaccess'.",
-      });
-    }
+        paymentTypes = "FULL_PAYMENT",
+        pinCode,
+        networkId,
+      } = req.body;
 
-    let transaction;
+      if (!authUserId) throw httpError(401, "Not authorized");
+      if (req.body.userId && String(req.body.userId) !== String(authUserId)) {
+        throw httpError(403, "User mismatch");
+      }
 
-    // 6. Check if failed
-    const failed =
-      !result ||
-      result.success === false ||
-      result.status === false ||
-      result.data?.success === "false";
+      const userId = authUserId;
+      const user = await User.findById(userId).session(session);
+      if (!user) throw httpError(404, "User not found");
 
-    if (failed) {
-      await refundToVirtualAccount(userId, sellingPrice);
-      transaction = await saveTransaction({
-        response: result || {},
-        serviceType: "cable_tv",
-        status: "failed",
-        extra: {
-          userId,
-          amount: sellingPrice,
-          tenantId: effectiveTenantId,
-          tenantOwnerUserId,
-          platform_price: basePrice,
-          selling_price: sellingPrice,
-          merchant_profit: sellingPrice - basePrice,
+      const plan = await ServicePlan.findById(planId)
+        .populate("subServiceId")
+        .session(session);
+      if (!plan || !plan.active) {
+        throw httpError(404, "Plan not found or inactive");
+      }
+
+      const basePrice = Number(plan.ourPrice);
+      if (!Number.isFinite(basePrice) || basePrice <= 0) {
+        throw httpError(400, "Invalid plan pricing");
+      }
+
+      let effectiveTenantId = user.tenantId || null;
+      let tenantOwnerUserId = null;
+      if (effectiveTenantId) {
+        const tenant = await Tenant.findById(effectiveTenantId)
+          .select("status ownerUserId")
+          .session(session);
+        if (!tenant || tenant.status !== "active") {
+          effectiveTenantId = null;
+        } else {
+          tenantOwnerUserId = tenant.ownerUserId || null;
+        }
+      }
+
+      let override = null;
+      if (effectiveTenantId) {
+        override =
+          (await TenantPlanPrice.findOne({
+            tenantId: effectiveTenantId,
+            userId: user._id,
+            planId: plan._id,
+            active: true,
+          })
+            .select("pricingType value active")
+            .session(session)) ||
+          (await TenantPlanPrice.findOne({
+            tenantId: effectiveTenantId,
+            userId: null,
+            planId: plan._id,
+            active: true,
+          })
+            .select("pricingType value active")
+            .session(session));
+      }
+
+      const rawSellingPrice = computeSellingPrice(basePrice, override);
+      const sellingPrice =
+        rawSellingPrice === null ? null : Math.round(rawSellingPrice);
+      if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
+        throw httpError(400, "Unable to compute selling price");
+      }
+
+      const { pinRequired } = await enforceTenantRiskControls({
+        user,
+        amount: sellingPrice,
+        service: "cable_tv",
+        session,
+      });
+      if (pinRequired || user.pinStatus) {
+        if (!pinCode || typeof pinCode !== "string") {
+          throw httpError(400, "Transaction PIN is required");
+        }
+        if (!user.pinCode) {
+          throw httpError(400, "Set your transaction PIN to continue");
+        }
+        const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
+        if (!isPinValid) {
+          throw httpError(401, "Invalid transaction PIN");
+        }
+      }
+
+      const enabledApi = plan.subServiceId.provider;
+      const previousBalance = user.balance;
+      const debitResult = await deductFromVirtualAccount(
+        userId,
+        sellingPrice,
+        session
+      );
+
+      let mappedCodes = null;
+      if (networkId) {
+        const networkKey = networkId.toLowerCase();
+        mappedCodes = NETWORK_MAP[networkKey];
+        if (!mappedCodes) {
+          throw httpError(400, "Invalid network selected");
+        }
+      }
+
+      let providerResult;
+      if (enabledApi === "autopilot") {
+        providerResult = await AutopilotService.payTVSubscription({
+          cableType: provider,
+          planId: plan.autopilotId,
+          smartCardNo,
+          customerName,
           phone,
-          network: mappedCodes?.[enabledApi],
+          amount: basePrice,
+          paymentTypes,
+        });
+      } else if (enabledApi === "easyaccess") {
+        providerResult = await EasyAccessService.payTVSubscription({
           company: provider,
           iucno: smartCardNo,
-          customer_name: customerName,
-          provider: enabledApi,
-        },
-        transaction_type: "debit",
-        previous_balance: previousBalance,
-        new_balance: previousBalance,
-      });
+          packageCode: plan.easyaccessId,
+          amount: basePrice,
+        });
+      } else {
+        throw httpError(400, "Invalid API provider. Use 'autopilot' or 'easyaccess'.");
+      }
 
-      return res.status(400).json({
-        message: "❌ TV Subscription purchase failed",
-        transactionId: transaction._id,
-        error: result?.error || "TV subscription failed",
-      });
-    }
+      const isFailure =
+        !providerResult ||
+        providerResult.success === false ||
+        providerResult.status === false ||
+        providerResult.data?.success === "false";
 
-    // 7. Success
-    const updatedUser = await User.findById(userId);
-    transaction = await saveTransaction({
-      response: result || {},
-      serviceType: "cable_tv",
-      status: "success",
-      extra: {
+      const txnExtra = {
         userId,
         amount: sellingPrice,
         tenantId: effectiveTenantId,
@@ -250,17 +247,57 @@ const purchaseTVSub = async (req, res) => {
         iucno: smartCardNo,
         customer_name: customerName,
         provider: enabledApi,
-      },
-      transaction_type: "debit",
-      previous_balance: previousBalance,
-      new_balance: updatedUser?.balance,
+      };
+
+      let finalBalance = debitResult?.new_balance ?? previousBalance;
+      if (isFailure) {
+        const refundResult = await refundToVirtualAccount(
+          userId,
+          sellingPrice,
+          session
+        );
+        finalBalance = refundResult?.new_balance ?? previousBalance;
+      }
+
+      const transaction = await saveTransaction(
+        {
+          response: providerResult || {},
+          serviceType: "cable_tv",
+          status: isFailure ? "failed" : "success",
+          extra: txnExtra,
+          transaction_type: "debit",
+          previous_balance: previousBalance,
+          new_balance: finalBalance,
+        },
+        { session }
+      );
+
+      return isFailure
+        ? {
+            status: 400,
+            body: {
+              message: "❌ TV Subscription purchase failed",
+              transactionId: transaction?._id,
+              request_id: transaction?._id,
+              transaction: toTransactionSummary(transaction),
+              error: providerResult?.error || "TV subscription failed",
+              success: false,
+            },
+          }
+        : {
+            status: 200,
+            body: {
+              message: "✅ TV Subscription purchase successful",
+              transactionId: transaction?._id,
+              request_id: transaction?._id,
+              transaction: toTransactionSummary(transaction),
+              data: providerResult.data,
+              success: true,
+            },
+          };
     });
 
-    return res.status(200).json({
-      message: "✅ TV Subscription purchase successful",
-      transactionId: transaction._id,
-      data: result.data,
-    });
+    return res.status(result.status).json(result.body);
   } catch (err) {
     console.error("Error purchasing TV subscription:", err);
     const status = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;

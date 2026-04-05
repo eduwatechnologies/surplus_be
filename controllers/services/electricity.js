@@ -10,6 +10,7 @@ const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
   enforceTenantRiskControls,
+  runInMongoTransaction,
 } = require("../../business_logic/billstackLogic");
 
 const NETWORK_MAP = {
@@ -25,6 +26,33 @@ const NETWORK_MAP = {
   beninelectric: { easyaccess: "10", autopilot: "10" }, // BEDC
   abaelectric: { easyaccess: "11", autopilot: "11" }, // ABA
   yolaelectric: { easyaccess: "12", autopilot: "12" }, // YEDC
+};
+
+const httpError = (statusCode, message) => {
+  const e = new Error(message);
+  e.statusCode = statusCode;
+  return e;
+};
+
+const toTransactionSummary = (t) => {
+  if (!t) return null;
+  return {
+    _id: t._id,
+    service: t.service,
+    status: t.status,
+    message: t.message,
+    amount: t.amount,
+    reference_no: t.reference_no,
+    provider_reference: t.provider_reference,
+    createdAt: t.createdAt,
+    company: t.company,
+    meter_type: t.meter_type,
+    meter_no: t.meter_no,
+    token: t.token,
+    customer_name: t.customer_name,
+    previous_balance: t.previous_balance,
+    new_balance: t.new_balance,
+  };
 };
 
 const verifyMeter = async (req, res) => {
@@ -69,127 +97,107 @@ const verifyMeter = async (req, res) => {
 
 const purchaseElectricity = async (req, res) => {
   try {
-    const authUserId = req.user?._id;
-    const { company, type, meter_no, amount, userId: bodyUserId, pinCode, planId, phone } =
-      req.body;
+    const result = await runInMongoTransaction(async (session) => {
+      const authUserId = req.user?._id;
+      const {
+        company,
+        type,
+        meter_no,
+        amount,
+        userId: bodyUserId,
+        pinCode,
+        planId,
+        phone,
+      } = req.body;
 
-    if (!authUserId) return res.status(401).json({ error: "Not authorized" });
-    if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
-      return res.status(403).json({ error: "User mismatch" });
-    }
-
-    if (!company || !type || !meter_no || !amount || !phone) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    const parsedAmount = Number(amount);
-    if (!Number.isFinite(parsedAmount) || parsedAmount < 50) {
-      return res.status(400).json({ error: "Invalid amount" });
-    }
-
-    const userId = authUserId;
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    let effectiveTenantId = user.tenantId || null;
-    let tenantOwnerUserId = null;
-    if (effectiveTenantId) {
-      const t = await Tenant.findById(effectiveTenantId).select("status ownerUserId").lean();
-      if (!t || t.status !== "active") {
-        effectiveTenantId = null;
-      } else {
-        tenantOwnerUserId = t.ownerUserId || null;
+      if (!authUserId) throw httpError(401, "Not authorized");
+      if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
+        throw httpError(403, "User mismatch");
       }
-    }
 
-    const { pinRequired } = await enforceTenantRiskControls({ user, amount: parsedAmount, service: "electricity" });
-    if (pinRequired || user.pinStatus) {
-      if (!pinCode || typeof pinCode !== "string") {
-        return res.status(400).json({ error: "Transaction PIN is required" });
+      if (!company || !type || !meter_no || !amount || !phone) {
+        throw httpError(400, "Missing required fields");
       }
-      if (!user.pinCode) {
-        return res.status(400).json({ error: "Set your transaction PIN to continue" });
+
+      const parsedAmount = Number(amount);
+      if (!Number.isFinite(parsedAmount) || parsedAmount < 50) {
+        throw httpError(400, "Invalid amount");
       }
-      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
-      if (!isPinValid) {
-        return res.status(401).json({ error: "Invalid transaction PIN" });
+
+      const userId = authUserId;
+      const user = await User.findById(userId).session(session);
+      if (!user) throw httpError(404, "User not found");
+
+      let effectiveTenantId = user.tenantId || null;
+      let tenantOwnerUserId = null;
+      if (effectiveTenantId) {
+        const t = await Tenant.findById(effectiveTenantId)
+          .select("status ownerUserId")
+          .session(session);
+        if (!t || t.status !== "active") {
+          effectiveTenantId = null;
+        } else {
+          tenantOwnerUserId = t.ownerUserId || null;
+        }
       }
-    }
 
-    const plan = await SubService.findById(planId);
-    if (!plan) {
-      return res.status(404).json({ error: "Plan not found or inactive" });
-    }
-
-    const previousBalance = user?.balance;
-
-    await deductFromVirtualAccount(userId, parsedAmount);
-
-    const enabledApi = plan.provider;
-    const companyKey = company.toLowerCase().replace(/\s+/g, "");
-    const mappedCodes = NETWORK_MAP[companyKey];
-    if (!mappedCodes) {
-      return res.status(400).json({ error: `Invalid Disco '${company}'` });
-    }
-
-    const result =
-      enabledApi === "autopilot"
-        ? await AutopilotService.purchaseElectricity({
-            disco: mappedCodes.autopilot,
-            meterNumber: meter_no,
-            meterType: type.toLowerCase() === "prepaid" ? "01" : "02",
-            amount: parsedAmount,
-          })
-        : await EasyAccessService.payElectricityBill({
-            company: mappedCodes.easyaccess,
-            metertype: type.toLowerCase() === "prepaid" ? "01" : "02",
-            meterno: meter_no,
-            amount: parsedAmount,
-          });
-
-    let transaction;
-
-    if (
-      result.success === false ||
-      result.data?.success === "false" ||
-      result.data?.success === "false_disabled" ||
-      result.status === false
-    ) {
-      transaction = await saveTransaction({
-        response: result || {},
-        serviceType: "electricity",
-        status: "failed",
-        extra: {
-          userId,
-          tenantId: effectiveTenantId,
-          tenantOwnerUserId,
-          amount: parsedAmount,
-          phone,
-          network: company.toLowerCase(),
-          meterType: type,
-          company,
-          provider: enabledApi,
-        },
-        previous_balance: previousBalance,
-        new_balance: previousBalance,
+      const { pinRequired } = await enforceTenantRiskControls({
+        user,
+        amount: parsedAmount,
+        service: "electricity",
+        session,
       });
+      if (pinRequired || user.pinStatus) {
+        if (!pinCode || typeof pinCode !== "string") {
+          throw httpError(400, "Transaction PIN is required");
+        }
+        if (!user.pinCode) {
+          throw httpError(400, "Set your transaction PIN to continue");
+        }
+        const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
+        if (!isPinValid) {
+          throw httpError(401, "Invalid transaction PIN");
+        }
+      }
 
-      await refundToVirtualAccount(userId, parsedAmount);
+      const plan = await SubService.findById(planId).session(session);
+      if (!plan) throw httpError(404, "Plan not found or inactive");
 
-      return res.status(400).json({
-        message: "❌ Electricity purchase failed",
-        transactionId: transaction?._id || null,
-        error: result?.error || "Purchase failed from provider",
-      });
-    }
+      const previousBalance = user?.balance;
 
-    const refundedUser = await User.findById(userId);
+      const debitResult = await deductFromVirtualAccount(
+        userId,
+        parsedAmount,
+        session
+      );
 
-    transaction = await saveTransaction({
-      response: result,
-      serviceType: "electricity",
-      status: "success",
-      extra: {
+      const enabledApi = plan.provider;
+      const companyKey = company.toLowerCase().replace(/\s+/g, "");
+      const mappedCodes = NETWORK_MAP[companyKey];
+      if (!mappedCodes) throw httpError(400, `Invalid Disco '${company}'`);
+
+      const providerResult =
+        enabledApi === "autopilot"
+          ? await AutopilotService.purchaseElectricity({
+              disco: mappedCodes.autopilot,
+              meterNumber: meter_no,
+              meterType: type.toLowerCase() === "prepaid" ? "01" : "02",
+              amount: parsedAmount,
+            })
+          : await EasyAccessService.payElectricityBill({
+              company: mappedCodes.easyaccess,
+              metertype: type.toLowerCase() === "prepaid" ? "01" : "02",
+              meterno: meter_no,
+              amount: parsedAmount,
+            });
+
+      const isFailure =
+        providerResult?.success === false ||
+        providerResult?.data?.success === "false" ||
+        providerResult?.data?.success === "false_disabled" ||
+        providerResult?.status === false;
+
+      const txnExtra = {
         userId,
         tenantId: effectiveTenantId,
         tenantOwnerUserId,
@@ -199,16 +207,54 @@ const purchaseElectricity = async (req, res) => {
         meterType: type,
         company,
         provider: enabledApi,
-      },
-      previous_balance: previousBalance,
-      new_balance: refundedUser.balance,
+      };
+
+      let finalBalance = debitResult?.new_balance ?? previousBalance;
+      if (isFailure) {
+        const refundResult = await refundToVirtualAccount(
+          userId,
+          parsedAmount,
+          session
+        );
+        finalBalance = refundResult?.new_balance ?? previousBalance;
+      }
+
+      const transaction = await saveTransaction(
+        {
+          response: providerResult || {},
+          serviceType: "electricity",
+          status: isFailure ? "failed" : "success",
+          extra: txnExtra,
+          previous_balance: previousBalance,
+          new_balance: finalBalance,
+        },
+        { session }
+      );
+
+      return isFailure
+        ? {
+            status: 400,
+            body: {
+              message: "❌ Electricity purchase failed",
+              transactionId: transaction?._id || null,
+              transaction: toTransactionSummary(transaction),
+              error: providerResult?.error || "Purchase failed from provider",
+              success: false,
+            },
+          }
+        : {
+            status: 200,
+            body: {
+              message: "✅ Electricity purchase successful",
+              transactionId: transaction?._id || null,
+              transaction: toTransactionSummary(transaction),
+              data: providerResult.data,
+              success: true,
+            },
+          };
     });
 
-    return res.status(200).json({
-      message: "✅ Electricity purchase successful",
-      transactionId: transaction?._id || null,
-      data: result.data,
-    });
+    return res.status(result.status).json(result.body);
   } catch (err) {
     console.error("Error purchasing electricity:", err);
     const status = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;

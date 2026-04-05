@@ -1,5 +1,6 @@
 
  function getDataTypeFromPlanId(planId) {
+  planId = String(planId || "");
 
   // Common mapping patterns for all networks
   const mapping = [
@@ -18,7 +19,7 @@
     if (rule.startsWith && planId.startsWithAnyNetwork(rule.startsWith)) {
       return rule.type;
     }
-    if (rule.includes && id.includes(rule.includes)) {
+    if (rule.includes && planId.includes(rule.includes)) {
       return rule.type;
     }
   }
@@ -33,4 +34,3 @@ String.prototype.startsWithAnyNetwork = function (suffix) {
 };
 
 module.exports = getDataTypeFromPlanId;
-

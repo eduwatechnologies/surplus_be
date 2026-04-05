@@ -1,17 +1,14 @@
 const Transaction = require("../../models/transactionModel");
 const generateRefNo = require("../../utils/functions/refNoGenerator");
 
-const saveTransaction = async ({
-  response,
-  serviceType,
-  status,
-  previous_balance,
-  new_balance,
-  extra = {},
-}) => {
+const saveTransaction = async (
+  { response, serviceType, status, previous_balance, new_balance, extra = {} },
+  options = {}
+) => {
   try {
     const data = response?.data || {};
     const refNo = generateRefNo();
+    const session = options?.session || null;
 
     // ✅ Ensure provider_reference is always unique
     const providerReference =
@@ -22,9 +19,11 @@ const saveTransaction = async ({
       `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     // ✅ Check if this provider_reference already exists
-    const existing = await Transaction.findOne({
+    let existingQuery = Transaction.findOne({
       provider_reference: providerReference,
     });
+    if (session) existingQuery = existingQuery.session(session);
+    const existing = await existingQuery;
 
     if (existing) {
       console.warn(
@@ -135,8 +134,15 @@ const saveTransaction = async ({
 
     const finalTransaction = { ...baseTransaction, ...details };
 
+    if (session) {
+      const saved = await Transaction.create([finalTransaction], { session });
+      const doc = Array.isArray(saved) ? saved[0] : saved;
+      console.log(`[${serviceType}] Transaction ${status} saved:`, doc?._id);
+      return doc;
+    }
+
     const saved = await Transaction.create(finalTransaction);
-    console.log(`[${serviceType}] Transaction ${status} saved:`, saved._id);
+    console.log(`[${serviceType}] Transaction ${status} saved:`, saved?._id);
     return saved;
   } catch (error) {
     if (error.code === 11000) {

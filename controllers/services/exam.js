@@ -1,4 +1,3 @@
-const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const User = require("../../models/userModel");
 const Tenant = require("../../models/tenantModel");
@@ -11,9 +10,32 @@ const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
   enforceTenantRiskControls,
+  runInMongoTransaction,
 } = require("../../business_logic/billstackLogic");
 
 const ALLOWED_PIN_COUNTS = [1, 2, 3, 4, 5, 10];
+
+const httpError = (statusCode, message) => {
+  const e = new Error(message);
+  e.statusCode = statusCode;
+  return e;
+};
+
+const toTransactionSummary = (t) => {
+  if (!t) return null;
+  return {
+    _id: t._id,
+    service: t.service,
+    status: t.status,
+    message: t.message,
+    amount: t.amount,
+    reference_no: t.reference_no,
+    provider_reference: t.provider_reference,
+    createdAt: t.createdAt,
+    previous_balance: t.previous_balance,
+    new_balance: t.new_balance,
+  };
+};
 
 function computeSellingPrice(basePrice, override) {
   const base = Number(basePrice);
@@ -36,210 +58,138 @@ function computeSellingPrice(basePrice, override) {
 }
 
 const purchaseExamPin = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
-    const authUserId = req.user?._id;
-    const { noOfPin, userId: bodyUserId, pinCode, planId } = req.body;
+    const result = await runInMongoTransaction(async (session) => {
+      const authUserId = req.user?._id;
+      const { noOfPin, userId: bodyUserId, pinCode, planId } = req.body;
 
-    if (!authUserId) {
-      await session.abortTransaction();
-      return res.status(401).json({ success: false, message: "Not authorized" });
-    }
-    if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
-      await session.abortTransaction();
-      return res.status(403).json({ success: false, message: "User mismatch" });
-    }
+      if (!authUserId) throw httpError(401, "Not authorized");
+      if (bodyUserId && String(bodyUserId) !== String(authUserId)) {
+        throw httpError(403, "User mismatch");
+      }
 
-    // 1️⃣ Validate required fields
-    if (!noOfPin || !planId) {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "Missing required fields: 'noOfPin', 'planId'",
-      });
-    }
+      if (!noOfPin || !planId) {
+        throw httpError(400, "Missing required fields: 'noOfPin', 'planId'");
+      }
 
-    // 2️⃣ Validate allowed pin count
-    if (!ALLOWED_PIN_COUNTS.includes(Number(noOfPin))) {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "Invalid number of pins. Allowed values: 1, 2, 3, 4, 5, 10",
-      });
-    }
+      if (!ALLOWED_PIN_COUNTS.includes(Number(noOfPin))) {
+        throw httpError(
+          400,
+          "Invalid number of pins. Allowed values: 1, 2, 3, 4, 5, 10"
+        );
+      }
 
-    // 3️⃣ Validate user
-    const userId = authUserId;
-    const user = await User.findById(userId).session(session);
-    if (!user) {
-      await session.abortTransaction();
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
+      const userId = authUserId;
+      const user = await User.findById(userId).session(session);
+      if (!user) throw httpError(404, "User not found");
 
-    // 5️⃣ Fetch plan from DB (with populated subService)
-    const plan = await servicePlanModel
-      .findById(planId)
-      .populate("subServiceId")
-      .session(session);
-
-    if (!plan || !plan.active) {
-      await session.abortTransaction();
-      return res.status(404).json({
-        success: false,
-        message: "Selected plan not found or inactive",
-      });
-    }
-
-    const baseUnitPrice = Number(plan.ourPrice);
-    if (!Number.isFinite(baseUnitPrice) || baseUnitPrice <= 0) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: "Invalid plan pricing" });
-    }
-
-    let effectiveTenantId = user.tenantId || null;
-    let tenantOwnerUserId = null;
-    if (effectiveTenantId) {
-      const tenant = await Tenant.findById(effectiveTenantId)
-        .select("status ownerUserId")
+      const plan = await servicePlanModel
+        .findById(planId)
+        .populate("subServiceId")
         .session(session);
-      if (!tenant || tenant.status !== "active") {
-        effectiveTenantId = null;
-      } else {
-        tenantOwnerUserId = tenant.ownerUserId || null;
+
+      if (!plan || !plan.active) {
+        throw httpError(404, "Selected plan not found or inactive");
       }
-    }
 
-    let override = null;
-    if (effectiveTenantId) {
-      override =
-        (await TenantPlanPrice.findOne({
-          tenantId: effectiveTenantId,
-          userId: user._id,
-          planId: plan._id,
-          active: true,
-        })
-          .select("pricingType value active")
-          .session(session)) ||
-        (await TenantPlanPrice.findOne({
-          tenantId: effectiveTenantId,
-          userId: null,
-          planId: plan._id,
-          active: true,
-        })
-          .select("pricingType value active")
-          .session(session));
-    }
-
-    const rawSellingUnit = computeSellingPrice(baseUnitPrice, override);
-    const sellingUnitPrice = rawSellingUnit === null ? null : Math.round(rawSellingUnit);
-    if (!Number.isFinite(sellingUnitPrice) || sellingUnitPrice <= 0) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: "Unable to compute selling price" });
-    }
-
-    const baseTotalCost = baseUnitPrice * Number(noOfPin);
-    const totalCost = sellingUnitPrice * Number(noOfPin);
-    const previousBalance = user.balance;
-
-    const { pinRequired } = await enforceTenantRiskControls({ user, amount: totalCost, service: "exam_pin", session });
-    if (pinRequired || user.pinStatus) {
-      if (!pinCode || typeof pinCode !== "string") {
-        await session.abortTransaction();
-        return res.status(400).json({ success: false, message: "Transaction PIN is required" });
+      const baseUnitPrice = Number(plan.ourPrice);
+      if (!Number.isFinite(baseUnitPrice) || baseUnitPrice <= 0) {
+        throw httpError(400, "Invalid plan pricing");
       }
-      if (!user.pinCode) {
-        await session.abortTransaction();
-        return res.status(400).json({ success: false, message: "Set your transaction PIN to continue" });
-      }
-      const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
-      if (!isPinValid) {
-        await session.abortTransaction();
-        return res.status(401).json({ success: false, message: "Invalid transaction PIN" });
-      }
-    }
 
-    // 6️⃣ Check wallet balance
-    if (user.balance < totalCost) {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient balance. You need at least ₦${totalCost}`,
+      let effectiveTenantId = user.tenantId || null;
+      let tenantOwnerUserId = null;
+      if (effectiveTenantId) {
+        const tenant = await Tenant.findById(effectiveTenantId)
+          .select("status ownerUserId")
+          .session(session);
+        if (!tenant || tenant.status !== "active") {
+          effectiveTenantId = null;
+        } else {
+          tenantOwnerUserId = tenant.ownerUserId || null;
+        }
+      }
+
+      let override = null;
+      if (effectiveTenantId) {
+        override =
+          (await TenantPlanPrice.findOne({
+            tenantId: effectiveTenantId,
+            userId: user._id,
+            planId: plan._id,
+            active: true,
+          })
+            .select("pricingType value active")
+            .session(session)) ||
+          (await TenantPlanPrice.findOne({
+            tenantId: effectiveTenantId,
+            userId: null,
+            planId: plan._id,
+            active: true,
+          })
+            .select("pricingType value active")
+            .session(session));
+      }
+
+      const rawSellingUnit = computeSellingPrice(baseUnitPrice, override);
+      const sellingUnitPrice =
+        rawSellingUnit === null ? null : Math.round(rawSellingUnit);
+      if (!Number.isFinite(sellingUnitPrice) || sellingUnitPrice <= 0) {
+        throw httpError(400, "Unable to compute selling price");
+      }
+
+      const baseTotalCost = baseUnitPrice * Number(noOfPin);
+      const totalCost = sellingUnitPrice * Number(noOfPin);
+      const previousBalance = user.balance;
+
+      const { pinRequired } = await enforceTenantRiskControls({
+        user,
+        amount: totalCost,
+        service: "exam_pin",
+        session,
       });
-    }
+      if (pinRequired || user.pinStatus) {
+        if (!pinCode || typeof pinCode !== "string") {
+          throw httpError(400, "Transaction PIN is required");
+        }
+        if (!user.pinCode) {
+          throw httpError(400, "Set your transaction PIN to continue");
+        }
+        const isPinValid = await bcrypt.compare(pinCode, user.pinCode);
+        if (!isPinValid) {
+          throw httpError(401, "Invalid transaction PIN");
+        }
+      }
 
-    // 7️⃣ Deduct from wallet
-    await deductFromVirtualAccount(userId, totalCost, session);
+      if (user.balance < totalCost) {
+        throw httpError(
+          400,
+          `Insufficient balance. You need at least ₦${totalCost}`
+        );
+      }
 
-    const enabledApi = plan.provider; // e.g. "easyaccess"
-    let result;
+      const debitResult = await deductFromVirtualAccount(
+        userId,
+        totalCost,
+        session
+      );
 
-    // 8️⃣ Call API provider
-    if (enabledApi === "easyaccess") {
-      result = await EasyAccessService.purchaseExamPin({
+      const enabledApi = plan.provider;
+      if (enabledApi !== "easyaccess") {
+        throw httpError(400, "Invalid provider configured for this plan");
+      }
+
+      const providerResult = await EasyAccessService.purchaseExamPin({
         no_of_pins: noOfPin,
-        type: plan.category, // WAEC, NECO etc.
-        // exam_id: plan.easyaccessId, // provider’s internal id
-      });
-    } else {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "Invalid provider configured for this plan",
-      });
-    }
-
-    // 9️⃣ Handle failed provider response
-    const isSuccess =
-      result?.success === true ||
-      result?.status === true ||
-      result?.data?.success === true;
-
-    if (!isSuccess) {
-      // refund user immediately
-      await refundToVirtualAccount(userId, totalCost, session);
-
-      const failedTx = await saveTransaction({
-        response: result || {},
-        serviceType: "exam_pin",
-        status: "failed",
-        extra: {
-          userId,
-          tenantId: effectiveTenantId,
-          tenantOwnerUserId,
-          platform_price: baseTotalCost,
-          selling_price: totalCost,
-          merchant_profit: totalCost - baseTotalCost,
-          planId,
-          noOfPin,
-          amount: totalCost,
-          provider: enabledApi,
-        },
-        previous_balance: previousBalance,
-        new_balance: previousBalance,
+        type: plan.category,
       });
 
-      await session.commitTransaction();
-      return res.status(400).json({
-        success: false,
-        message:
-          result?.data?.message || result?.error || "Exam pin purchase failed",
-        transactionId: failedTx._id,
-      });
-    }
+      const isSuccess =
+        providerResult?.success === true ||
+        providerResult?.status === true ||
+        providerResult?.data?.success === true;
 
-    // 🔟 If successful, finalize and log transaction
-    const updatedUser = await User.findById(userId).session(session);
-
-    const successTx = await saveTransaction({
-      response: result || {},
-      serviceType: "exam_pin",
-      status: "success",
-      extra: {
+      const txnExtra = {
         userId,
         tenantId: effectiveTenantId,
         tenantOwnerUserId,
@@ -250,26 +200,63 @@ const purchaseExamPin = async (req, res) => {
         noOfPin,
         amount: totalCost,
         provider: enabledApi,
-      },
-      previous_balance: previousBalance,
-      new_balance: updatedUser.balance,
+      };
+
+      const isFailure = !isSuccess;
+      let finalBalance = debitResult?.new_balance ?? previousBalance;
+      if (isFailure) {
+        const refundResult = await refundToVirtualAccount(
+          userId,
+          totalCost,
+          session
+        );
+        finalBalance = refundResult?.new_balance ?? previousBalance;
+      }
+
+      const savedTx = await saveTransaction(
+        {
+          response: providerResult || {},
+          serviceType: "exam_pin",
+          status: isFailure ? "failed" : "success",
+          extra: txnExtra,
+          previous_balance: previousBalance,
+          new_balance: finalBalance,
+        },
+        { session }
+      );
+
+      return isFailure
+        ? {
+            status: 400,
+            body: {
+              success: false,
+              message:
+                providerResult?.data?.message ||
+                providerResult?.error ||
+                "Exam pin purchase failed",
+              transactionId: savedTx?._id,
+              request_id: savedTx?._id,
+              transaction: toTransactionSummary(savedTx),
+            },
+          }
+        : {
+            status: 200,
+            body: {
+              success: true,
+              message: "✅ Exam pin purchase successful",
+              data: providerResult.data,
+              transactionId: savedTx?._id,
+              request_id: savedTx?._id,
+              transaction: toTransactionSummary(savedTx),
+            },
+          };
     });
 
-    await session.commitTransaction();
-
-    return res.status(200).json({
-      success: true,
-      message: "✅ Exam pin purchase successful",
-      data: result.data,
-      transactionId: successTx._id,
-    });
+    return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("Error purchasing exam pin:", error);
-    await session.abortTransaction();
     const status = error?.statusCode && Number.isFinite(error.statusCode) ? error.statusCode : 500;
     return res.status(status).json({ success: false, message: error.message || "Internal Server Error" });
-  } finally {
-    session.endSession();
   }
 };
 

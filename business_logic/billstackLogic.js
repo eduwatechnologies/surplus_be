@@ -8,49 +8,7 @@ const checkBalance = async (userId) => {
   return user?.balance || 0;
 };
 
-// const deductFromVirtualAccount = async (userId, amount) => {
-//   try {
-//     if (!mongoose.Types.ObjectId.isValid(userId)) {
-//       throw new Error("Invalid user ID format");
-//     }
 
-//     // Ensure amount is a valid number
-//     const numericAmount = Number(amount);
-//     if (isNaN(numericAmount) || numericAmount <= 0) {
-//       throw new Error("Invalid amount specified");
-//     }
-
-//     // Fetch user with balance field only to optimize performance
-//     const user = await User.findById(userId).select("balance");
-
-//     if (!user) {
-//       throw new Error("User account not found");
-//     }
-
-//     // Ensure balance is a number
-//     user.balance = Number(user.balance) || 0;
-
-//     if (user.balance < numericAmount) {
-//       throw new Error("Insufficient balance");
-//     }
-
-//     const previous_balance = user.balance; // capture old balance
-//     const new_balance = previous_balance - numericAmount; // ✅ subtract
-
-//     // Deduct and save
-//     user.balance = new_balance;
-//     await user.save();
-
-//     console.log(
-//       `✅ Deducted ${numericAmount} from user ${userId}. Previous: ${previous_balance}, New balance: ${new_balance}`
-//     );
-
-//     return { userId, previous_balance, new_balance };
-//   } catch (error) {
-//     console.error("❌ Error in deductFromVirtualAccount:", error.message);
-//     throw error;
-//   }
-// };
 
 const deductFromVirtualAccount = async (userId, amount, session = null) => {
   try {
@@ -263,10 +221,26 @@ const enforceTenantRiskControls = async ({ user, amount, service = null, session
   return { pinRequired, tenant };
 };
 
+const runInMongoTransaction = async (work) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const result = await work(session);
+    await session.commitTransaction();
+    return result;
+  } catch (error) {
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
+  }
+};
+
 module.exports = {
   checkBalance,
   deductFromVirtualAccount,
   refundToVirtualAccount,
   updateUserBalance,
   enforceTenantRiskControls,
+  runInMongoTransaction,
 };

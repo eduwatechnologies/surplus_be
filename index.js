@@ -11,7 +11,7 @@ const mongoose = require("mongoose");
 const { attachTenantFromHost } = require("./middlewares/auth");
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 4000;
 
 // ✅ Trust proxy (important for rate limiting behind Render/z
 app.set("trust proxy", 1);
@@ -26,10 +26,8 @@ app.use(
 
 const allowedOrigins = [
   process.env.FRONTEND_URL,
-  "https://adminalmaleek.vercel.app",
-  "https://www.almaleek.com.ng",
-  "https://almaleek-admin.vercel.app",
-  "https://almaleek-pi.vercel.app",
+ "https://surplusfe-production.up.railway.app",
+ "https://surplusadmin-production.up.railway.app",
   "http://localhost:3000",
   "http://localhost:3001",
 ];

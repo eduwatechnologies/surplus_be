@@ -27,15 +27,15 @@ const getPlansByNetworkAndCategory = async (req, res) => {
   try {
     let { network, category, serviceType } = req.query;
 
-    if (!network || !category) {
+    if (!network) {
       return res.status(400).json({
         success: false,
-        message: "Both 'network' and 'category' are required",
+        message: "'network' is required",
       });
     }
 
     network = network.toLowerCase().trim();
-    category = category.toLowerCase().trim();
+    category = typeof category === "string" ? category.toLowerCase().trim() : "";
 
     const networkCodes = resolveNetworkCodes(network);
     if (!networkCodes) {
@@ -48,9 +48,9 @@ const getPlansByNetworkAndCategory = async (req, res) => {
     const normalizedServiceType = normalizeServiceType(serviceType);
     const q = {
       network: { $in: networkCodes },
-      category: { $regex: `^${category}$`, $options: "i" },
       active: true,
     };
+    if (category) q.category = { $regex: `^${category}$`, $options: "i" };
     if (normalizedServiceType) q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
 
     const plans = await ServicePlan.find(q).lean();
