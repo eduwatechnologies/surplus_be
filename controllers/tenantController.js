@@ -3,6 +3,7 @@ const Tenant = require("../models/tenantModel");
 const User = require("../models/userModel");
 const ServicePlan = require("../models/servicePlanModel");
 const TenantPlanPrice = require("../models/tenantPlanPriceModel");
+const Service = require("../models/servicesModel");
 const Transaction = require("../models/transactionModel");
 const RefreshToken = require("../models/refreshTokenModal");
 const ActivityLog = require("../models/activityLogModel");
@@ -104,16 +105,30 @@ const getPublicTenantPlans = asyncHandler(async (req, res) => {
     return res.status(404).json({ error: "Merchant not found" });
   }
 
-  const disabled = Array.isArray(tenant.disabledServices) ? tenant.disabledServices : [];
-  if (serviceType && disabled.includes(serviceType)) {
+  const enabledTypesRows = await Service.find({ status: true }).select("type -_id").lean();
+  const enabledTypes = new Set((enabledTypesRows || []).map((r) => String(r.type || "").trim().toLowerCase()).filter(Boolean));
+
+  const disabledRaw = Array.isArray(tenant.disabledServices) ? tenant.disabledServices : [];
+  const disabled = new Set(
+    disabledRaw
+      .map((s) => normalizeServiceType(s))
+      .map((s) => String(s || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  const normalizedQueryServiceType = normalizeServiceType(serviceType);
+  if (normalizedQueryServiceType && disabled.has(normalizedQueryServiceType)) {
+    return res.json({ data: { tenant: { slug: tenant.slug }, plans: [] } });
+  }
+  if (normalizedQueryServiceType && !enabledTypes.has(normalizedQueryServiceType)) {
     return res.json({ data: { tenant: { slug: tenant.slug }, plans: [] } });
   }
 
   const q = { active: true };
-  if (serviceType) {
-    q.serviceType = serviceType;
-  } else if (disabled.length) {
-    q.serviceType = { $nin: disabled };
+  if (normalizedQueryServiceType) {
+    q.serviceType = normalizedQueryServiceType;
+  } else {
+    q.serviceType = { $in: Array.from(enabledTypes).filter((t) => !disabled.has(t)) };
   }
 
   const plans = await ServicePlan.find(q)
@@ -263,11 +278,12 @@ const updateMyTenant = asyncHandler(async (req, res) => {
   }
 
   if ("disabledServices" in body) {
-    const allowed = ["airtime", "data", "electricity", "cable_tv", "exam_pin"];
+    const allowed = ["airtime", "data", "electricity", "cable", "exam"];
     const input = Array.isArray(body.disabledServices) ? body.disabledServices : [];
     update.disabledServices = Array.from(
       new Set(
         input
+          .map((s) => normalizeServiceType(s))
           .map((s) => String(s || "").trim().toLowerCase())
           .filter((s) => allowed.includes(s))
       )
@@ -920,6 +936,12 @@ const getMyPricingCatalog = asyncHandler(async (req, res) => {
   const normalizedCategory = String(category).toLowerCase().trim();
   const normalizedServiceType = normalizeServiceType(serviceType);
 
+  const enabledTypesRows = await Service.find({ status: true }).select("type -_id").lean();
+  const enabledTypes = new Set((enabledTypesRows || []).map((r) => String(r.type || "").trim().toLowerCase()).filter(Boolean));
+  if (normalizedServiceType && !enabledTypes.has(normalizedServiceType)) {
+    return res.json({ data: [] });
+  }
+
   const networkCodes = resolveNetworkCodes(normalizedNetwork);
   if (!networkCodes) {
     return res.status(400).json({
@@ -934,7 +956,11 @@ const getMyPricingCatalog = asyncHandler(async (req, res) => {
     category: { $regex: `^${normalizedCategory}$`, $options: "i" },
     active: true,
   };
-  if (normalizedServiceType) q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
+  if (normalizedServiceType) {
+    q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
+  } else {
+    q.serviceType = { $in: Array.from(enabledTypes) };
+  }
 
   const plans = await ServicePlan.find(q)
     .select("name validity category serviceType network ourPrice subServiceId")
@@ -993,6 +1019,12 @@ const getUserPricingCatalog = asyncHandler(async (req, res) => {
   const normalizedCategory = String(category).toLowerCase().trim();
   const normalizedServiceType = normalizeServiceType(serviceType);
 
+  const enabledTypesRows = await Service.find({ status: true }).select("type -_id").lean();
+  const enabledTypes = new Set((enabledTypesRows || []).map((r) => String(r.type || "").trim().toLowerCase()).filter(Boolean));
+  if (normalizedServiceType && !enabledTypes.has(normalizedServiceType)) {
+    return res.json({ data: [] });
+  }
+
   const networkCodes = resolveNetworkCodes(normalizedNetwork);
   if (!networkCodes) {
     return res.status(400).json({
@@ -1007,7 +1039,11 @@ const getUserPricingCatalog = asyncHandler(async (req, res) => {
     category: { $regex: `^${normalizedCategory}$`, $options: "i" },
     active: true,
   };
-  if (normalizedServiceType) q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
+  if (normalizedServiceType) {
+    q.serviceType = { $regex: `^${normalizedServiceType}$`, $options: "i" };
+  } else {
+    q.serviceType = { $in: Array.from(enabledTypes) };
+  }
 
   const plans = await ServicePlan.find(q)
     .select("name validity category serviceType network ourPrice subServiceId")

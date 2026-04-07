@@ -181,7 +181,18 @@ const getCategoriesByNetwork = async (req, res) => {
 
 const createServicePlan = async (req, res) => {
   try {
-    const servicePlan = new ServicePlan(req.body);
+    const payload = { ...req.body };
+    if (payload.serviceType) payload.serviceType = normalizeServiceType(payload.serviceType);
+    if (payload.network !== undefined) payload.network = String(payload.network || "").trim();
+    if (payload.planKind !== "variable" && payload.ourPrice !== undefined && payload.ourPrice !== null && payload.ourPrice !== "") {
+      const n = Number(payload.ourPrice);
+      payload.ourPrice = Number.isFinite(n) ? n : payload.ourPrice;
+    }
+    if (payload.planKind === "variable") {
+      delete payload.ourPrice;
+    }
+
+    const servicePlan = new ServicePlan(payload);
     await servicePlan.save();
     res.status(201).json({
       message: "Service plan created successfully",
@@ -195,7 +206,18 @@ const createServicePlan = async (req, res) => {
 // UPDATE
 const updateServicePlan = async (req, res) => {
   try {
-    const plan = await ServicePlan.findByIdAndUpdate(req.params.id, req.body, {
+    const payload = { ...req.body };
+    if (payload.serviceType) payload.serviceType = normalizeServiceType(payload.serviceType);
+    if (payload.network !== undefined) payload.network = String(payload.network || "").trim();
+    if (payload.planKind !== "variable" && payload.ourPrice !== undefined && payload.ourPrice !== null && payload.ourPrice !== "") {
+      const n = Number(payload.ourPrice);
+      payload.ourPrice = Number.isFinite(n) ? n : payload.ourPrice;
+    }
+    if (payload.planKind === "variable") {
+      delete payload.ourPrice;
+    }
+
+    const plan = await ServicePlan.findByIdAndUpdate(req.params.id, payload, {
       new: true,
     });
     if (!plan) return res.status(404).json({ message: "Plan not found" });

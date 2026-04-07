@@ -58,6 +58,24 @@ const deleteService = async (req, res) => {
   }
 };
 
+// TOGGLE STATUS (ON/OFF)
+const toggleServiceStatus = async (req, res) => {
+  try {
+    const service = await Service.findById(req.params.id);
+    if (!service) return res.status(404).json({ message: "Service not found" });
+
+    service.status = !service.status;
+    await service.save();
+
+    res.json({
+      message: `Service status changed to ${service.status}`,
+      data: service,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
 // GET all services with their subservices
 const getServicesWithSubServices = async (req, res) => {
   try {
@@ -113,4 +131,5 @@ module.exports = {
   getServices,
   createService,
   getServicesWithSubServices,
+  toggleServiceStatus,
 };

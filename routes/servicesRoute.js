@@ -6,6 +6,7 @@ const {
   updateService,
   deleteService,
   getServicesWithSubServices,
+  toggleServiceStatus,
 } = require("../controllers/servicesController");
 
 const { authMiddlewareStaff, checkRole } = require("../middlewares/auth");
@@ -24,6 +25,7 @@ router.get("/:id", getServiceById);
 
 // Only admin can update or delete
 router.put("/:id", authMiddlewareStaff, checkRole(["admin"]), updateService);
+router.patch("/:id/toggle-status", authMiddlewareStaff, checkRole(["admin"]), toggleServiceStatus);
 router.delete("/:id", authMiddlewareStaff, checkRole(["admin"]), deleteService);
 
 module.exports = router;
