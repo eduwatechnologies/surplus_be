@@ -27,7 +27,7 @@ app.use(
 const allowedOrigins = [
   process.env.FRONTEND_URL,
  "https://surplusfe-production.up.railway.app",
- "https://surplusadmin.up.railway.app",
+ "https://surplusadmin.up.railway.app"
   "http://localhost:3000",
   "http://localhost:3001",
 ];
