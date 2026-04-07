@@ -29,7 +29,7 @@ const allowedOrigins = [
  "https://surplusfe-production.up.railway.app",
  "https://surplusadmin.up.railway.app",
   "http://localhost:3000",
-  "http://localhost:3001",
+  "http://localhost:3002",
 ];
 app.use(
   cors({

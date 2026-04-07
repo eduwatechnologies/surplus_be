@@ -181,11 +181,13 @@ const purchaseData = async (req, res) => {
         }
       }
 
-      if (!categoryProvider || categoryProvider.status === false) {
+      if (categoryProvider && categoryProvider.status === false) {
         throw httpError(400, "This category is currently unavailable");
       }
 
-      const enabledApi = categoryProvider.provider;
+      const enabledApi =
+        categoryProvider?.provider ||
+        (plan.autopilotId ? "autopilot" : "easyaccess");
       const previousBalance = user?.balance;
 
       const debitResult = await deductFromVirtualAccount(
