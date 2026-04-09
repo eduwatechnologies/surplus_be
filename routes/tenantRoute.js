@@ -5,6 +5,7 @@ const {
   getMyTenant,
   updateMyTenant,
   getMyTenantContext,
+  getMyBankAccounts,
   upsertMyPlanPrices,
   getMyPlanPrices,
   getMyPricingCatalog,
@@ -25,6 +26,7 @@ const router = express.Router();
 
 router.post("/onboard", authMiddleware, onboardMerchant);
 router.get("/me", authMiddleware, getMyTenant);
+router.get("/me/bank-accounts", authMiddleware, checkUserRole(["merchant", "reseller"]), getMyBankAccounts);
 router.put("/me", authMiddleware, checkUserRole(["merchant", "reseller"]), updateMyTenant);
 router.get("/context", authMiddleware, getMyTenantContext);
 router.get("/customers", authMiddleware, checkUserRole(["merchant", "reseller"]), getMyCustomers);

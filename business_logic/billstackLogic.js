@@ -221,6 +221,48 @@ const enforceTenantRiskControls = async ({ user, amount, service = null, session
   return { pinRequired, tenant };
 };
 
+const chargeMerchantTransactionFee = async ({ merchantUserId, amount, session = null }) => {
+  if (!merchantUserId || !mongoose.Types.ObjectId.isValid(merchantUserId)) {
+    return { charged: false, deferred: false, merchantUserId: merchantUserId || null };
+  }
+  const fee = Number(amount);
+  if (!Number.isFinite(fee) || fee <= 0) {
+    return { charged: false, deferred: false, merchantUserId };
+  }
+
+  const chargedUser = await User.findOneAndUpdate(
+    { _id: merchantUserId, balance: { $gte: fee } },
+    { $inc: { balance: -fee } },
+    { new: true, session }
+  ).select("balance owning");
+
+  if (chargedUser) {
+    return {
+      charged: true,
+      deferred: false,
+      merchantUserId,
+      new_balance: chargedUser.balance,
+      owning: chargedUser.owning,
+      amount: fee,
+    };
+  }
+
+  const deferredUser = await User.findOneAndUpdate(
+    { _id: merchantUserId },
+    { $inc: { owning: fee } },
+    { new: true, session }
+  ).select("balance owning");
+
+  return {
+    charged: false,
+    deferred: true,
+    merchantUserId,
+    new_balance: deferredUser?.balance,
+    owning: deferredUser?.owning,
+    amount: fee,
+  };
+};
+
 const runInMongoTransaction = async (work) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -242,5 +284,6 @@ module.exports = {
   refundToVirtualAccount,
   updateUserBalance,
   enforceTenantRiskControls,
+  chargeMerchantTransactionFee,
   runInMongoTransaction,
 };

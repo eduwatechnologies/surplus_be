@@ -10,6 +10,7 @@ const {
   deductFromVirtualAccount,
   refundToVirtualAccount,
   enforceTenantRiskControls,
+  chargeMerchantTransactionFee,
   runInMongoTransaction,
 } = require("../../business_logic/billstackLogic");
 
@@ -130,14 +131,19 @@ const purchaseElectricity = async (req, res) => {
 
       let effectiveTenantId = user.tenantId || null;
       let tenantOwnerUserId = null;
+      let merchantFee = { enabled: false, amount: 0 };
       if (effectiveTenantId) {
         const t = await Tenant.findById(effectiveTenantId)
-          .select("status ownerUserId")
+          .select("status ownerUserId billingSettings")
           .session(session);
         if (!t || t.status !== "active") {
           effectiveTenantId = null;
         } else {
           tenantOwnerUserId = t.ownerUserId || null;
+          merchantFee = {
+            enabled: t.billingSettings?.merchantFeeEnabled === true,
+            amount: Number(t.billingSettings?.merchantFeeAmount || 0),
+          };
         }
       }
 
@@ -217,6 +223,17 @@ const purchaseElectricity = async (req, res) => {
           session
         );
         finalBalance = refundResult?.new_balance ?? previousBalance;
+      }
+
+      if (!isFailure && effectiveTenantId && tenantOwnerUserId && merchantFee.enabled && merchantFee.amount > 0) {
+        const merchantFeeResult = await chargeMerchantTransactionFee({
+          merchantUserId: tenantOwnerUserId,
+          amount: merchantFee.amount,
+          session,
+        });
+        txnExtra.merchant_fee_amount = merchantFeeResult?.amount ?? merchantFee.amount;
+        txnExtra.merchant_fee_charged = merchantFeeResult?.charged === true;
+        txnExtra.merchant_fee_deferred = merchantFeeResult?.deferred === true;
       }
 
       const transaction = await saveTransaction(

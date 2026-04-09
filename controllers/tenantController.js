@@ -1,6 +1,7 @@
 const asyncHandler = require("express-async-handler");
 const Tenant = require("../models/tenantModel");
 const User = require("../models/userModel");
+const Wallet = require("../models/walletModel");
 const ServicePlan = require("../models/servicePlanModel");
 const TenantPlanPrice = require("../models/tenantPlanPriceModel");
 const Service = require("../models/servicesModel");
@@ -249,11 +250,26 @@ const getMyTenant = asyncHandler(async (req, res) => {
 
   const tenantQuery = req.user?.tenantId ? { _id: req.user.tenantId } : { ownerUserId: userId };
   const tenant = await Tenant.findOne(tenantQuery).select(
-    "slug status brandName logoUrl primaryColor supportEmail supportPhone disabledServices riskSettings createdAt updatedAt"
+    "slug status brandName logoUrl primaryColor supportEmail supportPhone disabledServices riskSettings billingSettings createdAt updatedAt"
   );
   if (!tenant) return res.status(404).json({ error: "Merchant profile not found" });
 
   return res.json({ data: tenant });
+});
+
+const getMyBankAccounts = asyncHandler(async (req, res) => {
+  const userId = req.user?._id;
+  if (!userId) return res.status(401).json({ error: "Not authorized" });
+
+  const tenantQuery = req.user?.tenantId ? { _id: req.user.tenantId } : { ownerUserId: userId };
+  const tenant = await Tenant.findOne(tenantQuery).select("_id ownerUserId status");
+  if (!tenant || tenant.status !== "active") {
+    return res.status(404).json({ error: "Merchant profile not found" });
+  }
+
+  const ownerUserId = tenant.ownerUserId || userId;
+  const accounts = await Wallet.find({ user: ownerUserId }).sort({ createdAt: -1 }).lean();
+  return res.json({ accounts: accounts || [] });
 });
 
 const updateMyTenant = asyncHandler(async (req, res) => {
@@ -346,12 +362,25 @@ const updateMyTenant = asyncHandler(async (req, res) => {
     }
   }
 
+  if ("billingSettings" in body) {
+    const bs = body.billingSettings || {};
+    if (typeof bs.merchantFeeEnabled === "boolean") {
+      update["billingSettings.merchantFeeEnabled"] = bs.merchantFeeEnabled;
+    }
+    if ("merchantFeeAmount" in bs) {
+      const n = Number(bs.merchantFeeAmount);
+      if (Number.isFinite(n) && n >= 0 && n <= 1000000) {
+        update["billingSettings.merchantFeeAmount"] = n;
+      }
+    }
+  }
+
   const tenant = await Tenant.findOneAndUpdate(
     { _id: tenantId },
     { $set: update },
     { new: true }
   ).select(
-    "slug status brandName logoUrl primaryColor supportEmail supportPhone disabledServices riskSettings createdAt updatedAt"
+    "slug status brandName logoUrl primaryColor supportEmail supportPhone disabledServices riskSettings billingSettings createdAt updatedAt"
   );
 
   if (!tenant) return res.status(404).json({ error: "Merchant profile not found" });
@@ -378,7 +407,7 @@ const getMyTenantContext = asyncHandler(async (req, res) => {
   if (!tenantId) return res.json({ data: { tenant: null } });
 
   const tenant = await Tenant.findOne({ _id: tenantId, status: "active" }).select(
-    "slug status brandName logoUrl primaryColor supportEmail supportPhone disabledServices riskSettings"
+    "slug status brandName logoUrl primaryColor supportEmail supportPhone disabledServices riskSettings billingSettings"
   );
 
   if (!tenant) return res.json({ data: { tenant: null } });
@@ -395,6 +424,7 @@ const getMyTenantContext = asyncHandler(async (req, res) => {
         supportPhone: tenant.supportPhone || null,
         disabledServices: Array.isArray(tenant.disabledServices) ? tenant.disabledServices : [],
         riskSettings: tenant.riskSettings || null,
+        billingSettings: tenant.billingSettings || null,
       },
     },
   });
@@ -1104,6 +1134,7 @@ module.exports = {
   getPublicTenantPlans,
   onboardMerchant,
   getMyTenant,
+  getMyBankAccounts,
   updateMyTenant,
   getMyTenantContext,
   getMyPlanPrices,

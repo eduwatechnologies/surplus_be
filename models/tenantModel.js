@@ -45,6 +45,10 @@ const tenantSchema = new mongoose.Schema(
         email: { type: Boolean, default: false },
       },
     },
+    billingSettings: {
+      merchantFeeEnabled: { type: Boolean, default: false },
+      merchantFeeAmount: { type: Number, default: 0 },
+    },
   },
   { timestamps: true }
 );
